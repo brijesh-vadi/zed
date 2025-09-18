@@ -797,6 +797,27 @@ impl GitPanel {
         });
     }
 
+    fn open_single_file_diff(
+        &mut self,
+        _: &menu::Confirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
+            let _workspace = self.workspace.upgrade()?;
+
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    ProjectDiff::deploy_single_file(workspace, entry.clone(), window, cx);
+                })
+                .ok();
+            self.focus_handle.focus(window);
+
+            Some(())
+        });
+    }
+
     fn open_file(
         &mut self,
         _: &menu::SecondaryConfirm,
@@ -3993,10 +4014,16 @@ impl GitPanel {
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
                     cx.notify();
+                    // Click behavior:
+                    // - Right-click: Open individual file
+                    // - Cmd/Ctrl+click: Open individual file instead of multibuffer diff
+                    // - Regular click: Open multibuffer diff with all changes
                     if event.modifiers().secondary() {
                         this.open_file(&Default::default(), window, cx)
+                    } else if event.modifiers().platform || event.modifiers().control {
+                        this.open_file(&Default::default(), window, cx)
                     } else {
-                        this.open_diff(&Default::default(), window, cx);
+                        this.open_single_file_diff(&Default::default(), window, cx);
                         this.focus_handle.focus(window);
                     }
                 })

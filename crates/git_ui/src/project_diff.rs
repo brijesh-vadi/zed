@@ -25,6 +25,7 @@ use gpui::{
 };
 use language::{Anchor, Buffer, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
+use postage::prelude::Sink;
 use project::{
     Project, ProjectPath,
     git_store::{GitStore, GitStoreEvent, RepositoryEvent},
@@ -61,6 +62,7 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     update_needed: postage::watch::Sender<()>,
     pending_scroll: Option<PathKey>,
+    single_file_filter: Option<GitStatusEntry>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -130,6 +132,52 @@ impl ProjectDiff {
                 project_diff.move_to_entry(entry, window, cx);
             })
         }
+    }
+
+    pub fn deploy_single_file(
+        workspace: &mut Workspace,
+        entry: GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        telemetry::event!("Git Diff Single File Opened", source = "Git Panel");
+
+        let project_diff = if let Some(existing) = workspace.item_of_type::<Self>(cx) {
+            workspace.activate_item(&existing, true, true, window, cx);
+            // Clear the multibuffer and set single file filter
+            existing.update(cx, |project_diff, cx| {
+                project_diff.single_file_filter = Some(entry.clone());
+                project_diff.multibuffer.update(cx, |multibuffer, cx| {
+                    multibuffer.clear(cx);
+                });
+                // Trigger a reload with the single file filter
+                project_diff.update_needed.try_send(()).ok();
+            });
+            existing
+        } else {
+            let workspace_handle = cx.entity();
+            let project_diff = cx.new(|cx| Self::new(
+                workspace.project().clone(),
+                workspace_handle,
+                window,
+                cx
+            ));
+            project_diff.update(cx, |project_diff, _cx| {
+                project_diff.single_file_filter = Some(entry.clone());
+            });
+            workspace.add_item_to_active_pane(
+                Box::new(project_diff.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            project_diff
+        };
+
+        project_diff.update(cx, |project_diff, cx| {
+            project_diff.move_to_entry(entry, window, cx);
+        });
     }
 
     pub fn autoscroll(&self, cx: &mut Context<Self>) {
@@ -218,11 +266,13 @@ impl ProjectDiff {
             editor,
             multibuffer,
             pending_scroll: None,
+            single_file_filter: None,
             update_needed: send,
             _task: worker,
             _subscription: git_store_subscription,
         }
     }
+
 
     pub fn move_to_entry(
         &mut self,
@@ -384,6 +434,14 @@ impl ProjectDiff {
                 if !entry.status.has_changes() {
                     continue;
                 }
+
+                // If we have a single file filter, only process that file
+                if let Some(ref filter) = self.single_file_filter {
+                    if entry.repo_path != filter.repo_path {
+                        continue;
+                    }
+                }
+
                 let Some(project_path) = repo.repo_path_to_project_path(&entry.repo_path, cx)
                 else {
                     continue;
@@ -428,6 +486,7 @@ impl ProjectDiff {
         });
         result
     }
+
 
     fn register_buffer(
         &mut self,
@@ -529,6 +588,7 @@ impl ProjectDiff {
 
         Ok(())
     }
+
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn excerpt_paths(&self, cx: &App) -> Vec<String> {
