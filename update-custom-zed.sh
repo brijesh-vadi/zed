@@ -37,8 +37,7 @@ rm -rf target/
 cargo build --release
 
 # Export new build as .app bundle
-BUILD_DATE=$(date +%Y%m%d-%H%M%S)
-EXPORT_PATH="$HOME/Downloads/Zed-Custom-$BUILD_DATE.app"
+EXPORT_PATH="$HOME/Downloads/Zed.app"
 echo "📦 Creating .app bundle at $EXPORT_PATH"
 
 # Create app bundle structure
@@ -55,21 +54,21 @@ cat > "$EXPORT_PATH/Contents/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>Zed Custom</string>
+    <string>Zed</string>
     <key>CFBundleExecutable</key>
     <string>zed</string>
     <key>CFBundleIconFile</key>
     <string>app-icon</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.zed.Zed-Custom</string>
+    <string>dev.zed.Zed</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Zed Custom</string>
+    <string>Zed</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.206.0-custom</string>
+    <string>0.206.0</string>
     <key>CFBundleVersion</key>
     <string>0.206.0</string>
     <key>LSMinimumSystemVersion</key>
@@ -77,7 +76,7 @@ cat > "$EXPORT_PATH/Contents/Info.plist" << 'EOF'
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>© 2024 Zed Industries, Inc. (Custom Build)</string>
+    <string>© 2024 Zed Industries, Inc.</string>
 </dict>
 </plist>
 EOF
@@ -89,5 +88,5 @@ cp crates/zed/resources/app-icon@2x.png /tmp/zed-icon.iconset/icon_512x512@2x.pn
 iconutil -c icns /tmp/zed-icon.iconset -o "$EXPORT_PATH/Contents/Resources/app-icon.icns"
 rm -rf /tmp/zed-icon.iconset
 
-echo "✅ Update Complete! New .app bundle available at $EXPORT_PATH"
+echo "✅ Update Complete! Zed.app available at $EXPORT_PATH"
 echo "🚀 You can run it by double-clicking or: open '$EXPORT_PATH'"
