@@ -257,7 +257,7 @@ pub struct GitStatusEntry {
 }
 
 impl GitStatusEntry {
-    fn display_name(&self, path_style: PathStyle) -> String {
+    pub fn display_name(&self, path_style: PathStyle) -> String {
         self.repo_path
             .file_name()
             .map(|name| name.to_owned())
