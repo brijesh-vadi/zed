@@ -788,6 +788,11 @@
     //
     // Default: false
     "collapse_untracked_diff": false,
+    // Whether clicking on files in the git panel opens a single-file diff
+    // instead of the full multi-file diff view.
+    //
+    // Default: true
+    "single_file_diff_on_click": true,
     "scrollbar": {
       // When to show the scrollbar in the git panel.
       //

@@ -257,7 +257,7 @@ pub struct GitStatusEntry {
 }
 
 impl GitStatusEntry {
-    fn display_name(&self) -> String {
+    pub fn display_name(&self) -> String {
         self.repo_path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -4016,14 +4016,20 @@ impl GitPanel {
                     cx.notify();
                     // Click behavior:
                     // - Right-click: Open individual file
-                    // - Cmd/Ctrl+click: Open individual file instead of multibuffer diff
-                    // - Regular click: Open multibuffer diff with all changes
+                    // - Cmd/Ctrl+click: Open individual file instead of diff
+                    // - Regular click: Depends on setting - single file diff or full diff
                     if event.modifiers().secondary() {
                         this.open_file(&Default::default(), window, cx)
                     } else if event.modifiers().platform || event.modifiers().control {
                         this.open_file(&Default::default(), window, cx)
                     } else {
-                        this.open_single_file_diff(&Default::default(), window, cx);
+                        // Use setting to determine behavior
+                        let settings = GitPanelSettings::get_global(cx);
+                        if settings.single_file_diff_on_click {
+                            this.open_single_file_diff(&Default::default(), window, cx);
+                        } else {
+                            this.open_diff(&Default::default(), window, cx);
+                        }
                         this.focus_handle.focus(window);
                     }
                 })

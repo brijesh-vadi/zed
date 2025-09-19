@@ -460,6 +460,12 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: false
     pub collapse_untracked_diff: Option<bool>,
+
+    /// Whether clicking on files in the git panel opens a single-file diff
+    /// instead of the full multi-file diff view.
+    ///
+    /// Default: true
+    pub single_file_diff_on_click: Option<bool>,
 }
 
 #[derive(Default, Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

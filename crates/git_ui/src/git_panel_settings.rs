@@ -33,6 +33,7 @@ pub struct GitPanelSettings {
     pub fallback_branch_name: String,
     pub sort_by_path: bool,
     pub collapse_untracked_diff: bool,
+    pub single_file_diff_on_click: bool,
 }
 
 impl ScrollbarVisibility for GitPanelSettings {
@@ -65,6 +66,7 @@ impl Settings for GitPanelSettings {
             fallback_branch_name: git_panel.fallback_branch_name.unwrap(),
             sort_by_path: git_panel.sort_by_path.unwrap(),
             collapse_untracked_diff: git_panel.collapse_untracked_diff.unwrap(),
+            single_file_diff_on_click: git_panel.single_file_diff_on_click.unwrap(),
         }
     }
 
@@ -82,6 +84,8 @@ impl Settings for GitPanelSettings {
         self.sort_by_path.merge_from(&git_panel.sort_by_path);
         self.collapse_untracked_diff
             .merge_from(&git_panel.collapse_untracked_diff);
+        self.single_file_diff_on_click
+            .merge_from(&git_panel.single_file_diff_on_click);
         if let Some(show) = git_panel.scrollbar.as_ref().and_then(|s| s.show) {
             self.scrollbar.show = Some(show.into())
         }

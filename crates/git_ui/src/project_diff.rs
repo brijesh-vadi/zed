@@ -113,6 +113,17 @@ impl ProjectDiff {
         );
         let project_diff = if let Some(existing) = workspace.item_of_type::<Self>(cx) {
             workspace.activate_item(&existing, true, true, window, cx);
+            // Clear single file filter to show all files
+            existing.update(cx, |project_diff, cx| {
+                if project_diff.single_file_filter.is_some() {
+                    project_diff.single_file_filter = None;
+                    project_diff.multibuffer.update(cx, |multibuffer, cx| {
+                        multibuffer.clear(cx);
+                    });
+                    // Trigger a reload without the single file filter
+                    project_diff.update_needed.try_send(()).ok();
+                }
+            });
             existing
         } else {
             let workspace_handle = cx.entity();
@@ -643,7 +654,13 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, _: &App) -> AnyElement {
-        Label::new("Uncommitted Changes")
+        let title = if let Some(ref entry) = self.single_file_filter {
+            format!("Diff: {}", entry.display_name())
+        } else {
+            "Uncommitted Changes".to_string()
+        };
+
+        Label::new(title)
             .color(if params.selected {
                 Color::Default
             } else {
@@ -653,7 +670,11 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content_text(&self, _detail: usize, _: &App) -> SharedString {
-        "Uncommitted Changes".into()
+        if let Some(ref entry) = self.single_file_filter {
+            format!("Diff: {}", entry.display_name()).into()
+        } else {
+            "Uncommitted Changes".into()
+        }
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
