@@ -8,10 +8,10 @@ use serde::{
     de::{self, IntoDeserializer, MapAccess, SeqAccess, Visitor},
 };
 use serde_with::skip_serializing_none;
+use settings_macros::MergeFrom;
 use std::sync::Arc;
-use util::schemars::replace_subschema;
 
-use crate::ParameterizedJsonSchema;
+use crate::{ExtendingVec, merge_from};
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -31,12 +31,40 @@ pub struct AllLanguageSettingsContent {
     /// Settings for associating file extensions and filenames
     /// with languages.
     #[serde(default)]
-    pub file_types: HashMap<Arc<str>, Vec<String>>,
+    pub file_types: HashMap<Arc<str>, ExtendingVec<String>>,
+}
+
+impl merge_from::MergeFrom for AllLanguageSettingsContent {
+    fn merge_from(&mut self, other: &Self) {
+        self.file_types.merge_from(&other.file_types);
+        self.features.merge_from(&other.features);
+        self.edit_predictions.merge_from(&other.edit_predictions);
+
+        // A user's global settings override the default global settings and
+        // all default language-specific settings.
+        //
+        self.defaults.merge_from(&other.defaults);
+        for language_settings in self.languages.0.values_mut() {
+            language_settings.merge_from(&other.defaults);
+        }
+
+        // A user's language-specific settings override default language-specific settings.
+        for (language_name, user_language_settings) in &other.languages.0 {
+            if let Some(existing) = self.languages.0.get_mut(language_name) {
+                existing.merge_from(&user_language_settings);
+            } else {
+                let mut new_settings = self.defaults.clone();
+                new_settings.merge_from(&user_language_settings);
+
+                self.languages.0.insert(language_name.clone(), new_settings);
+            }
+        }
+    }
 }
 
 /// The settings for enabling/disabling features.
 #[skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct FeaturesContent {
     /// Determines which edit prediction provider to use.
@@ -44,7 +72,9 @@ pub struct FeaturesContent {
 }
 
 /// The provider that supplies edit predictions.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionProvider {
     None,
@@ -54,9 +84,20 @@ pub enum EditPredictionProvider {
     Zed,
 }
 
+impl EditPredictionProvider {
+    pub fn is_zed(&self) -> bool {
+        match self {
+            EditPredictionProvider::Zed => true,
+            EditPredictionProvider::None
+            | EditPredictionProvider::Copilot
+            | EditPredictionProvider::Supermaven => false,
+        }
+    }
+}
+
 /// The contents of the edit prediction settings.
 #[skip_serializing_none]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 pub struct EditPredictionSettingsContent {
     /// A list of globs representing files that edit predictions should be disabled for.
     /// This list adds to a pre-existing, sensible default set of globs.
@@ -73,7 +114,7 @@ pub struct EditPredictionSettingsContent {
 }
 
 #[skip_serializing_none]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 pub struct CopilotSettingsContent {
     /// HTTP/HTTPS proxy to use for Copilot.
     ///
@@ -90,7 +131,9 @@ pub struct CopilotSettingsContent {
 }
 
 /// The mode in which edit predictions should be displayed.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EditPredictionsMode {
     /// If provider supports it, display inline when holding modifier key (e.g., alt).
@@ -104,7 +147,19 @@ pub enum EditPredictionsMode {
 }
 
 /// Controls the soft-wrapping behavior in the editor.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SoftWrap {
     /// Prefer a single line generally, unless an overly long line is encountered.
@@ -122,11 +177,12 @@ pub enum SoftWrap {
 
 /// The settings for a particular language.
 #[skip_serializing_none]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct LanguageSettingsContent {
     /// How many columns a tab should occupy.
     ///
     /// Default: 4
+    #[schemars(range(min = 1, max = 128))]
     pub tab_size: Option<NonZeroU32>,
     /// Whether to indent lines using tab characters, as opposed to multiple
     /// spaces.
@@ -218,7 +274,7 @@ pub struct LanguageSettingsContent {
     /// Visible characters used to render whitespace when show_whitespaces is enabled.
     ///
     /// Default: "•" for spaces, "→" for tabs.
-    pub whitespace_map: Option<WhitespaceMap>,
+    pub whitespace_map: Option<WhitespaceMapContent>,
     /// Whether to start a new line with a comment when a previous line is a comment as well.
     ///
     /// Default: true
@@ -289,7 +345,19 @@ pub struct LanguageSettingsContent {
 }
 
 /// Controls how whitespace should be displayedin the editor.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowWhitespaceSetting {
     /// Draw whitespace only for the selected text.
@@ -310,28 +378,14 @@ pub enum ShowWhitespaceSetting {
 }
 
 #[skip_serializing_none]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct WhitespaceMap {
-    pub space: Option<String>,
-    pub tab: Option<String>,
-}
-
-impl WhitespaceMap {
-    pub fn space(&self) -> SharedString {
-        self.space
-            .as_ref()
-            .map_or_else(|| SharedString::from("•"), |s| SharedString::from(s))
-    }
-
-    pub fn tab(&self) -> SharedString {
-        self.tab
-            .as_ref()
-            .map_or_else(|| SharedString::from("→"), |s| SharedString::from(s))
-    }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct WhitespaceMapContent {
+    pub space: Option<char>,
+    pub tab: Option<char>,
 }
 
 /// The behavior of `editor::Rewrap`.
-#[derive(Debug, PartialEq, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub enum RewrapBehavior {
     /// Only rewrap within comments.
@@ -344,7 +398,7 @@ pub enum RewrapBehavior {
 }
 
 #[skip_serializing_none]
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct JsxTagAutoCloseSettingsContent {
     /// Enables or disables auto-closing of JSX tags.
     pub enabled: Option<bool>,
@@ -352,7 +406,7 @@ pub struct JsxTagAutoCloseSettingsContent {
 
 /// The settings for inlay hints.
 #[skip_serializing_none]
-#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
 pub struct InlayHintSettingsContent {
     /// Global switch to toggle hints on and off.
     ///
@@ -434,7 +488,7 @@ impl InlayHintKind {
 
 /// Controls how completions are processed for this language.
 #[skip_serializing_none]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct CompletionSettingsContent {
     /// Controls how words are completed.
@@ -462,7 +516,7 @@ pub struct CompletionSettingsContent {
     pub lsp_insert_mode: Option<LspInsertMode>,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub enum LspInsertMode {
     /// Replaces text before the cursor, using the `insert` range described in the LSP specification.
@@ -478,7 +532,7 @@ pub enum LspInsertMode {
 }
 
 /// Controls how document's words are completed.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub enum WordsCompletionMode {
     /// Always fetch document's words for completions along with LSP completions.
@@ -495,7 +549,7 @@ pub enum WordsCompletionMode {
 /// and configure default Prettier, used when no project-level Prettier installation is found.
 /// Prettier formatting is disabled by default.
 #[skip_serializing_none]
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct PrettierSettingsContent {
     /// Enables or disables formatting with Prettier for a given language.
     pub allowed: Option<bool>,
@@ -515,106 +569,17 @@ pub struct PrettierSettingsContent {
 }
 
 /// Controls the behavior of formatting files when they are saved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "lowercase")]
 pub enum FormatOnSave {
     /// Files should be formatted on save.
     On,
     /// Files should not be formatted on save.
     Off,
-    List(FormatterList),
-}
-
-impl JsonSchema for FormatOnSave {
-    fn schema_name() -> Cow<'static, str> {
-        "OnSaveFormatter".into()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let formatter_schema = Formatter::json_schema(generator);
-
-        json_schema!({
-            "oneOf": [
-                {
-                    "type": "array",
-                    "items": formatter_schema
-                },
-                {
-                    "type": "string",
-                    "enum": ["on", "off", "language_server"]
-                },
-                formatter_schema
-            ]
-        })
-    }
-}
-
-impl Serialize for FormatOnSave {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::On => serializer.serialize_str("on"),
-            Self::Off => serializer.serialize_str("off"),
-            Self::List(list) => list.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FormatOnSave {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct FormatDeserializer;
-
-        impl<'d> Visitor<'d> for FormatDeserializer {
-            type Value = FormatOnSave;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a valid on-save formatter kind")
-            }
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if v == "on" {
-                    Ok(Self::Value::On)
-                } else if v == "off" {
-                    Ok(Self::Value::Off)
-                } else if v == "language_server" {
-                    Ok(Self::Value::List(FormatterList::Single(
-                        Formatter::LanguageServer { name: None },
-                    )))
-                } else {
-                    let ret: Result<FormatterList, _> =
-                        Deserialize::deserialize(v.into_deserializer());
-                    ret.map(Self::Value::List)
-                }
-            }
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'d>,
-            {
-                let ret: Result<FormatterList, _> =
-                    Deserialize::deserialize(de::value::MapAccessDeserializer::new(map));
-                ret.map(Self::Value::List)
-            }
-            fn visit_seq<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'d>,
-            {
-                let ret: Result<FormatterList, _> =
-                    Deserialize::deserialize(de::value::SeqAccessDeserializer::new(map));
-                ret.map(Self::Value::List)
-            }
-        }
-        deserializer.deserialize_any(FormatDeserializer)
-    }
 }
 
 /// Controls which formatter should be used when formatting code.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, MergeFrom)]
 pub enum SelectedFormatter {
     /// Format files using Zed's Prettier integration (if applicable),
     /// or falling back to formatting via language server.
@@ -710,7 +675,7 @@ impl<'de> Deserialize<'de> for SelectedFormatter {
 }
 
 /// Controls which formatters should be used when formatting code.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
 #[serde(untagged)]
 pub enum FormatterList {
     Single(Formatter),
@@ -733,7 +698,7 @@ impl AsRef<[Formatter]> for FormatterList {
 }
 
 /// Controls which formatter should be used when formatting code. If there are multiple formatters, they are executed in the order of declaration.
-#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub enum Formatter {
     /// Format code using the current language server.
@@ -748,13 +713,13 @@ pub enum Formatter {
         /// The arguments to pass to the program.
         arguments: Option<Arc<[String]>>,
     },
-    /// Files should be formatted using code actions executed by language servers.
-    CodeActions(HashMap<String, bool>),
+    /// Files should be formatted using a code action executed by language servers.
+    CodeAction(String),
 }
 
 /// The settings for indent guides.
 #[skip_serializing_none]
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct IndentGuideSettingsContent {
     /// Whether to display indent guides in the editor.
     ///
@@ -780,7 +745,7 @@ pub struct IndentGuideSettingsContent {
 
 /// The task settings for a particular language.
 #[skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize, JsonSchema, MergeFrom)]
 pub struct LanguageTaskSettingsContent {
     /// Extra task variables to set for a particular language.
     #[serde(default)]
@@ -796,37 +761,15 @@ pub struct LanguageTaskSettingsContent {
     pub prefer_lsp: Option<bool>,
 }
 
-/// Map from language name to settings. Its `ParameterizedJsonSchema` allows only known language
-/// names in the keys.
+/// Map from language name to settings.
 #[skip_serializing_none]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct LanguageToSettingsMap(pub HashMap<SharedString, LanguageSettingsContent>);
 
-inventory::submit! {
-    ParameterizedJsonSchema {
-        add_and_get_ref: |generator, params, _cx| {
-            let language_settings_content_ref = generator
-                .subschema_for::<LanguageSettingsContent>()
-                .to_value();
-            replace_subschema::<LanguageToSettingsMap>(generator, || json_schema!({
-                "type": "object",
-                "properties": params
-                    .language_names
-                    .iter()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            language_settings_content_ref.clone(),
-                        )
-                    })
-                    .collect::<serde_json::Map<_, _>>()
-            }))
-        }
-    }
-}
-
 /// Determines how indent guides are colored.
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IndentGuideColoring {
     /// Do not render any lines for indent guides.
@@ -839,7 +782,9 @@ pub enum IndentGuideColoring {
 }
 
 /// Determines how indent guide backgrounds are colored.
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IndentGuideBackgroundColoring {
     /// Do not render any background for indent guides.

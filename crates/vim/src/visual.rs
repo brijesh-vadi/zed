@@ -314,7 +314,7 @@ impl Vim {
             let (start, end) = match s.newest_anchor().goal {
                 SelectionGoal::HorizontalRange { start, end } if preserve_goal => (start, end),
                 SelectionGoal::HorizontalPosition(start) if preserve_goal => (start, start),
-                _ => (tail_x.0, head_x.0),
+                _ => (tail_x.into(), head_x.into()),
             };
             let mut goal = SelectionGoal::HorizontalRange { start, end };
 
@@ -359,8 +359,8 @@ impl Vim {
 
             if !preserve_goal {
                 goal = SelectionGoal::HorizontalRange {
-                    start: positions.start.0,
-                    end: positions.end.0,
+                    start: f64::from(positions.start),
+                    end: f64::from(positions.end),
                 };
             }
 
@@ -609,8 +609,8 @@ impl Vim {
         self.store_visual_marks(window, cx);
         self.update_editor(cx, |vim, editor, cx| {
             let mut original_columns: HashMap<_, _> = Default::default();
-            let line_mode = line_mode || editor.selections.line_mode;
-            editor.selections.line_mode = false;
+            let line_mode = line_mode || editor.selections.line_mode();
+            editor.selections.set_line_mode(false);
 
             editor.transact(window, cx, |editor, window, cx| {
                 editor.change_selections(Default::default(), window, cx, |s| {
@@ -692,7 +692,7 @@ impl Vim {
     pub fn visual_yank(&mut self, line_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.store_visual_marks(window, cx);
         self.update_editor(cx, |vim, editor, cx| {
-            let line_mode = line_mode || editor.selections.line_mode;
+            let line_mode = line_mode || editor.selections.line_mode();
 
             // For visual line mode, adjust selections to avoid yanking the next line when on \n
             if line_mode && vim.mode != Mode::VisualBlock {
@@ -710,7 +710,7 @@ impl Vim {
                 });
             }
 
-            editor.selections.line_mode = line_mode;
+            editor.selections.set_line_mode(line_mode);
             let kind = if line_mode {
                 MotionKind::Linewise
             } else {

@@ -30,7 +30,9 @@ use gpui::{
     Render, Subscription, Task, WeakEntity, Window, actions,
 };
 use insert::{NormalBefore, TemporaryNormal};
-use language::{CharKind, CursorShape, Point, Selection, SelectionGoal, TransactionId};
+use language::{
+    CharKind, CharScopeContext, CursorShape, Point, Selection, SelectionGoal, TransactionId,
+};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
 use normal::search::SearchSubmit;
@@ -45,7 +47,6 @@ use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
 use theme::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
-use util::MergeFrom;
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
 use workspace::{self, Pane, Workspace};
@@ -239,6 +240,12 @@ actions!(
         PushReplaceWithRegister,
         /// Toggles comments.
         PushToggleComments,
+        /// Selects (count) next menu item
+        MenuSelectNext,
+        /// Selects (count) previous menu item
+        MenuSelectPrevious,
+        /// Clears count or toggles project panel focus
+        ToggleProjectPanelFocus,
         /// Starts a match operation.
         PushHelixMatch,
     ]
@@ -268,6 +275,53 @@ pub fn init(cx: &mut App) {
             update_settings_file(fs, cx, move |setting, _| {
                 setting.vim_mode = Some(!currently_enabled)
             })
+        });
+
+        workspace.register_action(|_, _: &MenuSelectNext, window, cx| {
+            let count = Vim::take_count(cx).unwrap_or(1);
+
+            for _ in 0..count {
+                window.dispatch_action(menu::SelectNext.boxed_clone(), cx);
+            }
+        });
+
+        workspace.register_action(|_, _: &MenuSelectPrevious, window, cx| {
+            let count = Vim::take_count(cx).unwrap_or(1);
+
+            for _ in 0..count {
+                window.dispatch_action(menu::SelectPrevious.boxed_clone(), cx);
+            }
+        });
+
+        workspace.register_action(|_, _: &ToggleProjectPanelFocus, window, cx| {
+            if Vim::take_count(cx).is_none() {
+                window.dispatch_action(project_panel::ToggleFocus.boxed_clone(), cx);
+            }
+        });
+
+        workspace.register_action(|workspace, n: &Number, window, cx| {
+            let vim = workspace
+                .focused_pane(window, cx)
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .and_then(|editor| editor.read(cx).addon::<VimAddon>().cloned());
+            if let Some(vim) = vim {
+                let digit = n.0;
+                vim.entity.update(cx, |_, cx| {
+                    cx.defer_in(window, move |vim, window, cx| {
+                        vim.push_count_digit(digit, window, cx)
+                    })
+                });
+            } else {
+                let count = Vim::globals(cx).pre_count.unwrap_or(0);
+                Vim::globals(cx).pre_count = Some(
+                    count
+                        .checked_mul(10)
+                        .and_then(|c| c.checked_add(n.0))
+                        .unwrap_or(count),
+                );
+            };
         });
 
         workspace.register_action(|_, _: &OpenDefaultKeymap, _, cx| {
@@ -423,14 +477,23 @@ impl Vim {
     pub fn new(window: &mut Window, cx: &mut Context<Editor>) -> Entity<Self> {
         let editor = cx.entity();
 
-        let mut initial_mode = VimSettings::get_global(cx).default_mode;
-        if initial_mode == Mode::Normal && HelixModeSetting::get_global(cx).0 {
-            initial_mode = Mode::HelixNormal;
-        }
+        let initial_vim_mode = VimSettings::get_global(cx).default_mode;
+        let (mode, last_mode) = if HelixModeSetting::get_global(cx).0 {
+            let initial_helix_mode = match initial_vim_mode {
+                Mode::Normal => Mode::HelixNormal,
+                Mode::Insert => Mode::Insert,
+                // Otherwise, we panic with a note that we should never get there due to the
+                // possible values of VimSettings::get_global(cx).default_mode being either Mode::Normal or Mode::Insert.
+                _ => unreachable!("Invalid default mode"),
+            };
+            (initial_helix_mode, Mode::HelixNormal)
+        } else {
+            (initial_vim_mode, Mode::Normal)
+        };
 
         cx.new(|cx| Vim {
-            mode: initial_mode,
-            last_mode: Mode::Normal,
+            mode,
+            last_mode,
             temp_mode: false,
             exit_temporary_mode: false,
             operator_stack: Vec::new(),
@@ -821,7 +884,7 @@ impl Vim {
         editor.set_collapse_matches(false);
         editor.set_input_enabled(true);
         editor.set_autoindent(true);
-        editor.selections.line_mode = false;
+        editor.selections.set_line_mode(false);
         editor.unregister_addon::<VimAddon>();
         editor.set_relative_line_number(None, cx);
         if let Some(vim) = Vim::globals(cx).focused_vim()
@@ -1091,6 +1154,8 @@ impl Vim {
                         let mut point = selection.head();
                         if !selection.reversed && !selection.is_empty() {
                             point = movement::left(map, selection.head());
+                        } else if selection.is_empty() {
+                            point = map.clip_point(point, Bias::Left);
                         }
                         selection.collapse_to(point, selection.goal)
                     } else if !last_mode.is_visual() && mode.is_visual() && selection.is_empty() {
@@ -1348,7 +1413,8 @@ impl Vim {
             let selection = editor.selections.newest::<usize>(cx);
 
             let snapshot = &editor.snapshot(window, cx).buffer_snapshot;
-            let (range, kind) = snapshot.surrounding_word(selection.start, true);
+            let (range, kind) =
+                snapshot.surrounding_word(selection.start, Some(CharScopeContext::Completion));
             if kind == Some(CharKind::Word) {
                 let text: String = snapshot.text_for_range(range).collect();
                 if !text.trim().is_empty() {
@@ -1606,7 +1672,7 @@ impl Vim {
             && !is_multicursor
             && [Mode::Visual, Mode::VisualLine, Mode::VisualBlock].contains(&self.mode)
         {
-            self.switch_mode(Mode::Normal, true, window, cx);
+            self.switch_mode(Mode::Normal, false, window, cx);
         }
     }
 
@@ -1783,7 +1849,9 @@ impl Vim {
             editor.set_collapse_matches(true);
             editor.set_input_enabled(vim.editor_input_enabled());
             editor.set_autoindent(vim.should_autoindent());
-            editor.selections.line_mode = matches!(vim.mode, Mode::VisualLine);
+            editor
+                .selections
+                .set_line_mode(matches!(vim.mode, Mode::VisualLine));
 
             let hide_edit_predictions = !matches!(vim.mode, Mode::Insert | Mode::Replace);
             editor.set_edit_predictions_hidden_for_vim_mode(hide_edit_predictions, window, cx);
@@ -1839,13 +1907,12 @@ impl From<settings::ModeContent> for Mode {
         match mode {
             ModeContent::Normal => Self::Normal,
             ModeContent::Insert => Self::Insert,
-            ModeContent::HelixNormal => Self::HelixNormal,
         }
     }
 }
 
 impl Settings for VimSettings {
-    fn from_defaults(content: &settings::SettingsContent, _cx: &mut App) -> Self {
+    fn from_settings(content: &settings::SettingsContent, _cx: &mut App) -> Self {
         let vim = content.vim.clone().unwrap();
         Self {
             default_mode: vim.default_mode.unwrap().into(),
@@ -1856,30 +1923,5 @@ impl Settings for VimSettings {
             highlight_on_yank_duration: vim.highlight_on_yank_duration.unwrap(),
             cursor_shape: vim.cursor_shape.unwrap().into(),
         }
-    }
-
-    fn refine(&mut self, content: &settings::SettingsContent, _cx: &mut App) {
-        let Some(vim) = content.vim.as_ref() else {
-            return;
-        };
-        self.default_mode
-            .merge_from(&vim.default_mode.map(Into::into));
-        self.toggle_relative_line_numbers
-            .merge_from(&vim.toggle_relative_line_numbers);
-        self.use_system_clipboard
-            .merge_from(&vim.use_system_clipboard);
-        self.use_smartcase_find.merge_from(&vim.use_smartcase_find);
-        self.custom_digraphs.merge_from(&vim.custom_digraphs);
-        self.highlight_on_yank_duration
-            .merge_from(&vim.highlight_on_yank_duration);
-        self.cursor_shape
-            .merge_from(&vim.cursor_shape.map(Into::into));
-    }
-
-    fn import_from_vscode(
-        _vscode: &settings::VsCodeSettings,
-        _current: &mut settings::SettingsContent,
-    ) {
-        // TODO: translate vim extension settings
     }
 }

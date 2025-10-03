@@ -238,7 +238,7 @@ impl ProjectPicker {
                         update_settings_file(fs, cx, {
                             let paths = paths
                                 .iter()
-                                .map(|path| path.to_string_lossy().to_string())
+                                .map(|path| path.to_string_lossy().into_owned())
                                 .collect();
                             move |settings, _| match index {
                                 ServerIndex::Ssh(index) => {
@@ -1885,7 +1885,7 @@ impl RemoteServerProjects {
         let ssh_settings = SshSettings::get_global(cx);
         let mut should_rebuild = false;
 
-        let ssh_connections_changed = ssh_settings.ssh_connections.iter().ne(state
+        let ssh_connections_changed = ssh_settings.ssh_connections.0.iter().ne(state
             .servers
             .iter()
             .filter_map(|server| match server {
@@ -1896,7 +1896,7 @@ impl RemoteServerProjects {
                 _ => None,
             }));
 
-        let wsl_connections_changed = ssh_settings.wsl_connections.iter().ne(state
+        let wsl_connections_changed = ssh_settings.wsl_connections.0.iter().ne(state
             .servers
             .iter()
             .filter_map(|server| match server {

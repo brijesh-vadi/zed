@@ -261,9 +261,8 @@ impl Tool for ReadFileTool {
                 Ok(result)
             } else {
                 // No line ranges specified, so check file size to see if it's too big.
-                let path_buf = std::path::PathBuf::from(&file_path);
                 let buffer_content =
-                    outline::get_buffer_content_or_outline(buffer.clone(), Some(&path_buf), cx)
+                    outline::get_buffer_content_or_outline(buffer.clone(), Some(&file_path), cx)
                         .await?;
 
                 action_log.update(cx, |log, cx| {
@@ -684,11 +683,14 @@ mod test {
                         "**/.secretdir".to_string(),
                         "**/.mymetadata".to_string(),
                     ]);
-                    settings.project.worktree.private_files = Some(vec![
-                        "**/.mysecrets".to_string(),
-                        "**/*.privatekey".to_string(),
-                        "**/*.mysensitive".to_string(),
-                    ]);
+                    settings.project.worktree.private_files = Some(
+                        vec![
+                            "**/.mysecrets".to_string(),
+                            "**/*.privatekey".to_string(),
+                            "**/*.mysensitive".to_string(),
+                        ]
+                        .into(),
+                    );
                 });
             });
         });
@@ -970,7 +972,8 @@ mod test {
                 store.update_user_settings(cx, |settings| {
                     settings.project.worktree.file_scan_exclusions =
                         Some(vec!["**/.git".to_string(), "**/node_modules".to_string()]);
-                    settings.project.worktree.private_files = Some(vec!["**/.env".to_string()]);
+                    settings.project.worktree.private_files =
+                        Some(vec!["**/.env".to_string()].into());
                 });
             });
         });

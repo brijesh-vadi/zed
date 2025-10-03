@@ -4,12 +4,12 @@ use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use client::{Client, ModelRequestUsage, UserStore, zed_urls};
 use cloud_llm_client::{
-    CLIENT_SUPPORTS_STATUS_MESSAGES_HEADER_NAME, CURRENT_PLAN_HEADER_NAME, CompletionBody,
-    CompletionEvent, CompletionRequestStatus, CountTokensBody, CountTokensResponse,
-    EXPIRED_LLM_TOKEN_HEADER_NAME, ListModelsResponse, MODEL_REQUESTS_RESOURCE_HEADER_VALUE, Plan,
-    PlanV1, PlanV2, SERVER_SUPPORTS_STATUS_MESSAGES_HEADER_NAME,
-    SUBSCRIPTION_LIMIT_RESOURCE_HEADER_NAME, TOOL_USE_LIMIT_REACHED_HEADER_NAME,
-    ZED_VERSION_HEADER_NAME,
+    CLIENT_SUPPORTS_STATUS_MESSAGES_HEADER_NAME, CLIENT_SUPPORTS_X_AI_HEADER_NAME,
+    CURRENT_PLAN_HEADER_NAME, CompletionBody, CompletionEvent, CompletionRequestStatus,
+    CountTokensBody, CountTokensResponse, EXPIRED_LLM_TOKEN_HEADER_NAME, ListModelsResponse,
+    MODEL_REQUESTS_RESOURCE_HEADER_VALUE, Plan, PlanV1, PlanV2,
+    SERVER_SUPPORTS_STATUS_MESSAGES_HEADER_NAME, SUBSCRIPTION_LIMIT_RESOURCE_HEADER_NAME,
+    TOOL_USE_LIMIT_REACHED_HEADER_NAME, ZED_VERSION_HEADER_NAME,
 };
 use futures::{
     AsyncBufReadExt, FutureExt, Stream, StreamExt, future::BoxFuture, stream::BoxStream,
@@ -19,7 +19,7 @@ use gpui::{
     AnyElement, AnyView, App, AsyncApp, Context, Entity, SemanticVersion, Subscription, Task,
 };
 use http_client::http::{HeaderMap, HeaderValue};
-use http_client::{AsyncBody, HttpClient, Method, Response, StatusCode};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, Method, Response, StatusCode};
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCacheConfiguration,
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId, LanguageModelName,
@@ -46,6 +46,7 @@ use util::{ResultExt as _, maybe};
 use crate::provider::anthropic::{AnthropicEventMapper, count_anthropic_tokens, into_anthropic};
 use crate::provider::google::{GoogleEventMapper, into_google};
 use crate::provider::open_ai::{OpenAiEventMapper, count_open_ai_tokens, into_open_ai};
+use crate::provider::x_ai::count_xai_tokens;
 
 const PROVIDER_ID: LanguageModelProviderId = language_model::ZED_CLOUD_PROVIDER_ID;
 const PROVIDER_NAME: LanguageModelProviderName = language_model::ZED_CLOUD_PROVIDER_NAME;
@@ -76,7 +77,7 @@ impl From<ModelMode> for AnthropicModelMode {
 
 pub struct CloudLanguageModelProvider {
     client: Arc<Client>,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
     _maintain_client_status: Task<()>,
 }
 
@@ -216,6 +217,7 @@ impl State {
 
         let request = http_client::Request::builder()
             .method(Method::GET)
+            .header(CLIENT_SUPPORTS_X_AI_HEADER_NAME, "true")
             .uri(http_client.build_zed_llm_url("/models", &[])?.as_ref())
             .header("Authorization", format!("Bearer {token}"))
             .body(AsyncBody::empty())?;
@@ -287,7 +289,7 @@ impl CloudLanguageModelProvider {
 impl LanguageModelProviderState for CloudLanguageModelProvider {
     type ObservableEntity = State;
 
-    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+    fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
         Some(self.state.clone())
     }
 }
@@ -391,20 +393,17 @@ impl CloudLanguageModel {
         let mut refreshed_token = false;
 
         loop {
-            let request_builder = http_client::Request::builder()
+            let request = http_client::Request::builder()
                 .method(Method::POST)
-                .uri(http_client.build_zed_llm_url("/completions", &[])?.as_ref());
-            let request_builder = if let Some(app_version) = app_version {
-                request_builder.header(ZED_VERSION_HEADER_NAME, app_version.to_string())
-            } else {
-                request_builder
-            };
-
-            let request = request_builder
+                .uri(http_client.build_zed_llm_url("/completions", &[])?.as_ref())
+                .when_some(app_version, |builder, app_version| {
+                    builder.header(ZED_VERSION_HEADER_NAME, app_version.to_string())
+                })
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {token}"))
                 .header(CLIENT_SUPPORTS_STATUS_MESSAGES_HEADER_NAME, "true")
                 .body(serde_json::to_string(&body)?.into())?;
+
             let mut response = http_client.send(request).await?;
             let status = response.status();
             if status.is_success() {
@@ -582,6 +581,7 @@ impl LanguageModel for CloudLanguageModel {
             Anthropic => language_model::ANTHROPIC_PROVIDER_ID,
             OpenAi => language_model::OPEN_AI_PROVIDER_ID,
             Google => language_model::GOOGLE_PROVIDER_ID,
+            XAi => language_model::X_AI_PROVIDER_ID,
         }
     }
 
@@ -591,6 +591,7 @@ impl LanguageModel for CloudLanguageModel {
             Anthropic => language_model::ANTHROPIC_PROVIDER_NAME,
             OpenAi => language_model::OPEN_AI_PROVIDER_NAME,
             Google => language_model::GOOGLE_PROVIDER_NAME,
+            XAi => language_model::X_AI_PROVIDER_NAME,
         }
     }
 
@@ -621,7 +622,8 @@ impl LanguageModel for CloudLanguageModel {
     fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
         match self.model.provider {
             cloud_llm_client::LanguageModelProvider::Anthropic
-            | cloud_llm_client::LanguageModelProvider::OpenAi => {
+            | cloud_llm_client::LanguageModelProvider::OpenAi
+            | cloud_llm_client::LanguageModelProvider::XAi => {
                 LanguageModelToolSchemaFormat::JsonSchema
             }
             cloud_llm_client::LanguageModelProvider::Google => {
@@ -651,6 +653,7 @@ impl LanguageModel for CloudLanguageModel {
                 })
             }
             cloud_llm_client::LanguageModelProvider::OpenAi
+            | cloud_llm_client::LanguageModelProvider::XAi
             | cloud_llm_client::LanguageModelProvider::Google => None,
         }
     }
@@ -670,6 +673,13 @@ impl LanguageModel for CloudLanguageModel {
                     Err(err) => return async move { Err(anyhow!(err)) }.boxed(),
                 };
                 count_open_ai_tokens(request, model, cx)
+            }
+            cloud_llm_client::LanguageModelProvider::XAi => {
+                let model = match x_ai::Model::from_id(&self.model.id.0) {
+                    Ok(model) => model,
+                    Err(err) => return async move { Err(anyhow!(err)) }.boxed(),
+                };
+                count_xai_tokens(request, model, cx)
             }
             cloud_llm_client::LanguageModelProvider::Google => {
                 let client = self.client.clone();
@@ -848,6 +858,56 @@ impl LanguageModel for CloudLanguageModel {
                 });
                 async move { Ok(future.await?.boxed()) }.boxed()
             }
+            cloud_llm_client::LanguageModelProvider::XAi => {
+                let client = self.client.clone();
+                let model = match x_ai::Model::from_id(&self.model.id.0) {
+                    Ok(model) => model,
+                    Err(err) => return async move { Err(anyhow!(err).into()) }.boxed(),
+                };
+                let request = into_open_ai(
+                    request,
+                    model.id(),
+                    model.supports_parallel_tool_calls(),
+                    model.supports_prompt_cache_key(),
+                    None,
+                    None,
+                );
+                let llm_api_token = self.llm_api_token.clone();
+                let future = self.request_limiter.stream(async move {
+                    let PerformLlmCompletionResponse {
+                        response,
+                        usage,
+                        includes_status_messages,
+                        tool_use_limit_reached,
+                    } = Self::perform_llm_completion(
+                        client.clone(),
+                        llm_api_token,
+                        app_version,
+                        CompletionBody {
+                            thread_id,
+                            prompt_id,
+                            intent,
+                            mode,
+                            provider: cloud_llm_client::LanguageModelProvider::XAi,
+                            model: request.model.clone(),
+                            provider_request: serde_json::to_value(&request)
+                                .map_err(|e| anyhow!(e))?,
+                        },
+                    )
+                    .await?;
+
+                    let mut mapper = OpenAiEventMapper::new();
+                    Ok(map_cloud_completion_events(
+                        Box::pin(
+                            response_lines(response, includes_status_messages)
+                                .chain(usage_updated_event(usage))
+                                .chain(tool_use_limit_reached_event(tool_use_limit_reached)),
+                        ),
+                        move |event| mapper.map_event(event),
+                    ))
+                });
+                async move { Ok(future.await?.boxed()) }.boxed()
+            }
             cloud_llm_client::LanguageModelProvider::Google => {
                 let client = self.client.clone();
                 let request =
@@ -977,8 +1037,6 @@ struct ZedAiConfiguration {
 
 impl RenderOnce for ZedAiConfiguration {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let young_account_banner = YoungAccountBanner;
-
         let is_pro = self.plan.is_some_and(|plan| {
             matches!(plan, Plan::V1(PlanV1::ZedPro) | Plan::V2(PlanV2::ZedPro))
         });
@@ -989,8 +1047,15 @@ impl RenderOnce for ZedAiConfiguration {
             (Some(Plan::V1(PlanV1::ZedProTrial) | Plan::V2(PlanV2::ZedProTrial)), Some(_)) => {
                 "You have access to Zed's hosted models through your Pro trial."
             }
-            (Some(Plan::V1(PlanV1::ZedFree) | Plan::V2(PlanV2::ZedFree)), Some(_)) => {
+            (Some(Plan::V1(PlanV1::ZedFree)), Some(_)) => {
                 "You have basic access to Zed's hosted models through the Free plan."
+            }
+            (Some(Plan::V2(PlanV2::ZedFree)), Some(_)) => {
+                if self.eligible_for_trial {
+                    "Subscribe for access to Zed's hosted models. Start with a 14 day free trial."
+                } else {
+                    "Subscribe for access to Zed's hosted models."
+                }
             }
             _ => {
                 if self.eligible_for_trial {
@@ -1041,7 +1106,7 @@ impl RenderOnce for ZedAiConfiguration {
 
         v_flex().gap_2().w_full().map(|this| {
             if self.account_too_young {
-                this.child(young_account_banner).child(
+                this.child(YoungAccountBanner).child(
                     Button::new("upgrade", "Upgrade to Pro")
                         .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
                         .full_width()
