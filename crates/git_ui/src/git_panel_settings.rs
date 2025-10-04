@@ -61,27 +61,6 @@ impl Settings for GitPanelSettings {
         }
     }
 
-    fn refine(&mut self, content: &settings::SettingsContent, _cx: &mut ui::App) {
-        let Some(git_panel) = &content.git_panel else {
-            return;
-        };
-        self.button.merge_from(&git_panel.button);
-        self.dock.merge_from(&git_panel.dock.map(Into::into));
-        self.default_width
-            .merge_from(&git_panel.default_width.map(px));
-        self.status_style.merge_from(&git_panel.status_style);
-        self.fallback_branch_name
-            .merge_from(&git_panel.fallback_branch_name);
-        self.sort_by_path.merge_from(&git_panel.sort_by_path);
-        self.collapse_untracked_diff
-            .merge_from(&git_panel.collapse_untracked_diff);
-        self.single_file_diff_on_click
-            .merge_from(&git_panel.single_file_diff_on_click);
-        if let Some(show) = git_panel.scrollbar.as_ref().and_then(|s| s.show) {
-            self.scrollbar.show = Some(show.into())
-        }
-    }
-
     fn import_from_vscode(vscode: &settings::VsCodeSettings, current: &mut SettingsContent) {
         if let Some(git_enabled) = vscode.read_bool("git.enabled") {
             current.git_panel.get_or_insert_default().button = Some(git_enabled);

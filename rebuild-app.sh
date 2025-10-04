@@ -29,8 +29,8 @@ rm -rf /Users/brijesh/Desktop/Zed.app
 rm -f /Users/brijesh/Desktop/Zed.dmg
 
 # Build release binaries
-print_status "Building release binaries..."
-if ! cargo build --release --package zed --package cli; then
+print_status "Building release binaries with 10 cores..."
+if ! cargo build --release --package zed --package cli -j 10; then
     print_error "Build failed!"
     exit 1
 fi

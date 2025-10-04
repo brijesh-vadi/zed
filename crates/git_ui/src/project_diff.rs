@@ -656,7 +656,7 @@ impl Item for ProjectDiff {
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, _: &App) -> AnyElement {
         let title = if let Some(ref entry) = self.single_file_filter {
-            format!("Diff: {}", entry.display_name())
+            format!("Diff: {}", entry.display_name(util::paths::PathStyle::local()))
         } else {
             "Uncommitted Changes".to_string()
         };
@@ -672,7 +672,7 @@ impl Item for ProjectDiff {
 
     fn tab_content_text(&self, _detail: usize, _: &App) -> SharedString {
         if let Some(ref entry) = self.single_file_filter {
-            format!("Diff: {}", entry.display_name()).into()
+            format!("Diff: {}", entry.display_name(util::paths::PathStyle::local())).into()
         } else {
             "Uncommitted Changes".into()
         }
