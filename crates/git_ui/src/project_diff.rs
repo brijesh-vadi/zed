@@ -24,7 +24,6 @@ use gpui::{
 };
 use language::{Anchor, Buffer, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
-use postage::prelude::Sink;
 use project::{
     Project, ProjectPath,
     git_store::{
@@ -158,7 +157,10 @@ impl ProjectDiff {
                         multibuffer.clear(cx);
                     });
                     // Trigger a reload without the single file filter
-                    project_diff.update_needed.try_send(()).ok();
+                    project_diff._task = window.spawn(cx, {
+                        let this = cx.weak_entity();
+                        async |cx| Self::refresh(this, cx).await
+                    });
                 }
             });
             existing
@@ -199,7 +201,10 @@ impl ProjectDiff {
                     multibuffer.clear(cx);
                 });
                 // Trigger a reload with the single file filter
-                project_diff.update_needed.try_send(()).ok();
+                project_diff._task = window.spawn(cx, {
+                    let this = cx.weak_entity();
+                    async |cx| Self::refresh(this, cx).await
+                });
             });
             existing
         } else {
@@ -375,6 +380,7 @@ impl ProjectDiff {
             multibuffer,
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
+            single_file_filter: None,
             _task: task,
             _subscription: branch_diff_subscription,
         }
@@ -612,10 +618,16 @@ impl ProjectDiff {
     pub async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
         let mut path_keys = Vec::new();
         let buffers_to_load = this.update(cx, |this, cx| {
-            let (repo, buffers_to_load) = this.branch_diff.update(cx, |branch_diff, cx| {
+            let (repo, mut buffers_to_load) = this.branch_diff.update(cx, |branch_diff, cx| {
                 let load_buffers = branch_diff.load_buffers(cx);
                 (branch_diff.repo().cloned(), load_buffers)
             });
+            
+            // Filter buffers if single_file_filter is set
+            if let Some(ref filter_entry) = this.single_file_filter {
+                buffers_to_load.retain(|entry| entry.repo_path == filter_entry.repo_path);
+            }
+            
             let mut previous_paths = this.multibuffer.read(cx).paths().collect::<HashSet<_>>();
 
             if let Some(repo) = repo {
@@ -734,6 +746,12 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        // Show filename in single-file mode
+        if let Some(ref filter_entry) = self.single_file_filter {
+            let filename = filter_entry.display_name(util::paths::PathStyle::Posix);
+            return format!("Diff: {}", filename).into();
+        }
+        
         match self.branch_diff.read(cx).diff_base() {
             DiffBase::Head => "Uncommitted Changes".into(),
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),

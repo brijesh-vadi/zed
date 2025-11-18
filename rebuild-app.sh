@@ -29,8 +29,8 @@ rm -rf /Users/brijesh/Desktop/Zed.app
 rm -f /Users/brijesh/Desktop/Zed.dmg
 
 # Build release binaries
-print_status "Building release binaries with 10 cores..."
-if ! cargo build --release --package zed --package cli -j 10; then
+print_status "Building release binaries with 8 cores (Apple Silicon only)..."
+if ! cargo build --release --package zed --package cli --target aarch64-apple-darwin -j 8; then
     print_error "Build failed!"
     exit 1
 fi
@@ -43,8 +43,8 @@ mkdir -p /Users/brijesh/Desktop/Zed.app/Contents/MacOS
 mkdir -p /Users/brijesh/Desktop/Zed.app/Contents/Resources
 
 # Copy binaries
-cp target/release/zed /Users/brijesh/Desktop/Zed.app/Contents/MacOS/
-cp target/release/cli /Users/brijesh/Desktop/Zed.app/Contents/MacOS/
+cp target/aarch64-apple-darwin/release/zed /Users/brijesh/Desktop/Zed.app/Contents/MacOS/
+cp target/aarch64-apple-darwin/release/cli /Users/brijesh/Desktop/Zed.app/Contents/MacOS/
 
 # Copy assets
 cp -r assets/* /Users/brijesh/Desktop/Zed.app/Contents/Resources/
@@ -81,9 +81,9 @@ cat > /Users/brijesh/Desktop/Zed.app/Contents/Info.plist << 'EOF'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.157.0</string>
+	<string>0.214.0</string>
 	<key>CFBundleVersion</key>
-	<string>157000</string>
+	<string>214000</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>10.15.7</string>
 	<key>NSHighResolutionCapable</key>
