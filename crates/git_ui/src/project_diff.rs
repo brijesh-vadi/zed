@@ -395,7 +395,7 @@ impl ProjectDiff {
         };
         let repo = git_repo.read(cx);
         let sort_prefix = sort_prefix(repo, &entry.repo_path, entry.status, cx);
-        let path_key = PathKey::with_sort_prefix(sort_prefix, entry.repo_path.0);
+        let path_key = PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
 
         self.move_to_path(path_key, window, cx)
     }
@@ -529,11 +529,6 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.branch_diff.read(cx).diff_base().is_merge_base() {
-            self.multibuffer.update(cx, |multibuffer, cx| {
-                multibuffer.add_diff(diff.clone(), cx);
-            });
-        }
         let subscription = cx.subscribe_in(&diff, window, move |this, _, _, window, cx| {
             this._task = window.spawn(cx, {
                 let this = cx.weak_entity();
@@ -550,8 +545,8 @@ impl ProjectDiff {
             .expect("project diff editor should have a conflict addon");
 
         let snapshot = buffer.read(cx).snapshot();
-        let diff = diff.read(cx);
-        let diff_hunk_ranges = diff
+        let diff_read = diff.read(cx);
+        let diff_hunk_ranges = diff_read
             .hunks_intersecting_range(Anchor::MIN..Anchor::MAX, &snapshot, cx)
             .map(|diff_hunk| diff_hunk.buffer_range);
         let conflicts = conflict_addon
@@ -574,6 +569,9 @@ impl ProjectDiff {
                 multibuffer_context_lines(cx),
                 cx,
             );
+            if self.branch_diff.read(cx).diff_base().is_merge_base() {
+                multibuffer.add_diff(diff.clone(), cx);
+            }
             (was_empty, is_newly_added)
         });
 
@@ -627,7 +625,7 @@ impl ProjectDiff {
                 for entry in buffers_to_load.iter() {
                     let sort_prefix = sort_prefix(&repo, &entry.repo_path, entry.file_status, cx);
                     let path_key =
-                        PathKey::with_sort_prefix(sort_prefix, entry.repo_path.0.clone());
+                        PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
                     previous_paths.remove(&path_key);
                     path_keys.push(path_key)
                 }
@@ -1649,9 +1647,6 @@ mod tests {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             theme::init(theme::LoadThemes::JustBase, cx);
-            language::init(cx);
-            Project::init_settings(cx);
-            workspace::init_settings(cx);
             editor::init(cx);
             crate::init(cx);
         });
