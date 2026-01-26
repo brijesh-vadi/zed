@@ -57,6 +57,9 @@
 ((identifier) @constant
  (#match? @constant "^_*[A-Z][A-Z\\d_]*$"))
 
+; Ensure enum variants are highlighted correctly regardless of naming convention
+(enum_variant name: (identifier) @type)
+
 [
   "("
   ")"
@@ -85,7 +88,6 @@
 [
   "as"
   "async"
-  "await"
   "const"
   "default"
   "dyn"
@@ -102,6 +104,7 @@
   "ref"
   "static"
   "struct"
+  "for"
   "trait"
   "type"
   "union"
@@ -114,10 +117,10 @@
 ] @keyword
 
 [
+  "await"
   "break"
   "continue"
   "else"
-  "for"
   "if"
   "in"
   "loop"
@@ -126,6 +129,9 @@
   "while"
   "yield"
 ] @keyword.control
+
+(for_expression
+  ("for" @keyword.control))
 
 [
   (string_literal)

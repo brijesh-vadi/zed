@@ -14,9 +14,10 @@ use std::{
 };
 use task::{Shell, ShellBuilder, ShellKind, SpawnInTerminal};
 use terminal::{
-    TaskState, TaskStatus, Terminal, TerminalBuilder, terminal_settings::TerminalSettings,
+    TaskState, TaskStatus, Terminal, TerminalBuilder, insert_zed_terminal_env,
+    terminal_settings::TerminalSettings,
 };
-use util::{get_default_system_shell, maybe, rel_path::RelPath};
+use util::{command::new_std_command, get_default_system_shell, maybe, rel_path::RelPath};
 
 use crate::{Project, ProjectPath};
 
@@ -90,8 +91,8 @@ impl Project {
                 .unwrap_or_else(get_default_system_shell),
             None => settings.shell.program(),
         };
-        let is_windows = self.path_style(cx).is_windows();
-        let shell_kind = ShellKind::new(&shell, is_windows);
+        let path_style = self.path_style(cx);
+        let shell_kind = ShellKind::new(&shell, path_style.is_windows());
 
         // Prepare a task for resolving the environment
         let env_task =
@@ -111,7 +112,7 @@ impl Project {
             );
         let toolchains = project_path_contexts
             .filter(|_| detect_venv)
-            .map(|p| self.active_toolchain(p, LanguageName::new("Python"), cx))
+            .map(|p| self.active_toolchain(p, LanguageName::new_static("Python"), cx))
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
@@ -128,9 +129,9 @@ impl Project {
                         .await
                         .ok();
                     let lister = language?.toolchain_lister()?;
-                    return cx
-                        .update(|cx| lister.activation_script(&toolchain, shell_kind, cx))
-                        .ok();
+                    let future =
+                        cx.update(|cx| lister.activation_script(&toolchain, shell_kind, cx));
+                    return Some(future.await);
                 }
                 None
             })
@@ -240,11 +241,14 @@ impl Project {
                         settings.cursor_shape,
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
+                        settings.path_hyperlink_regexes,
+                        settings.path_hyperlink_timeout_ms,
                         is_via_remote,
                         cx.entity_id().as_u64(),
                         Some(completion_tx),
                         cx,
                         activation_script,
+                        path_style,
                     ))
                 })??
                 .await?;
@@ -279,8 +283,37 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, cx)
+    }
+
+    /// Creates a local terminal even if the project is remote.
+    /// In remote projects: opens in Zed's launch directory (bypasses SSH).
+    /// In local projects: opens in the project directory (same as regular terminals).
+    pub fn create_local_terminal(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        let working_directory = if self.remote_client.is_some() {
+            // Remote project: don't use remote paths, let shell use Zed's cwd
+            None
+        } else {
+            // Local project: use project directory like normal terminals
+            self.active_project_directory(cx).map(|p| p.to_path_buf())
+        };
+        self.create_terminal_shell_internal(working_directory, true, cx)
+    }
+
+    /// Internal method for creating terminal shells.
+    /// If force_local is true, creates a local terminal even if the project has a remote client.
+    /// This allows "breaking out" to a local shell in remote projects.
+    fn create_terminal_shell_internal(
+        &mut self,
+        cwd: Option<PathBuf>,
+        force_local: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
-        let is_via_remote = self.remote_client.is_some();
+        let is_via_remote = !force_local && self.remote_client.is_some();
 
         let mut settings_location = None;
         if let Some(path) = path.as_ref()
@@ -309,9 +342,13 @@ impl Project {
             );
         let toolchains = project_path_contexts
             .filter(|_| detect_venv)
-            .map(|p| self.active_toolchain(p, LanguageName::new("Python"), cx))
+            .map(|p| self.active_toolchain(p, LanguageName::new_static("Python"), cx))
             .collect::<Vec<_>>();
-        let remote_client = self.remote_client.clone();
+        let remote_client = if force_local {
+            None
+        } else {
+            self.remote_client.clone()
+        };
         let shell = match &remote_client {
             Some(remote_client) => remote_client
                 .read(cx)
@@ -320,7 +357,7 @@ impl Project {
             None => settings.shell.program(),
         };
 
-        let is_windows = self.path_style(cx).is_windows();
+        let path_style = self.path_style(cx);
 
         // Prepare a task for resolving the environment
         let env_task =
@@ -328,7 +365,7 @@ impl Project {
 
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
-            let shell_kind = ShellKind::new(&shell, is_windows);
+            let shell_kind = ShellKind::new(&shell, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
 
@@ -342,9 +379,9 @@ impl Project {
                         .await
                         .ok();
                     let lister = language?.toolchain_lister()?;
-                    return cx
-                        .update(|cx| lister.activation_script(&toolchain, shell_kind, cx))
-                        .ok();
+                    let future =
+                        cx.update(|cx| lister.activation_script(&toolchain, shell_kind, cx));
+                    return Some(future.await);
                 }
                 None
             })
@@ -369,11 +406,14 @@ impl Project {
                         settings.cursor_shape,
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
+                        settings.path_hyperlink_regexes,
+                        settings.path_hyperlink_timeout_ms,
                         is_via_remote,
                         cx.entity_id().as_u64(),
                         None,
                         cx,
                         activation_script,
+                        path_style,
                     ))
                 })??
                 .await?;
@@ -505,13 +545,13 @@ impl Project {
                             None,
                             None,
                         )?;
-                        let mut command = std::process::Command::new(command_template.program);
+                        let mut command = new_std_command(command_template.program);
                         command.args(command_template.args);
                         command.envs(command_template.env);
                         Ok(command)
                     }
                     None => {
-                        let mut command = std::process::Command::new(command);
+                        let mut command = new_std_command(command);
                         command.args(args);
                         command.envs(env);
                         if let Some(path) = path {
@@ -564,8 +604,7 @@ fn create_remote_shell(
     remote_client: Entity<RemoteClient>,
     cx: &mut App,
 ) -> Result<(Shell, HashMap<String, String>)> {
-    // Set default terminfo that does not break the highlighting via ssh.
-    env.insert("TERM".to_string(), "xterm-256color".to_string());
+    insert_zed_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
 
     let (program, args) = match spawn_command {
         Some((program, args)) => (Some(program.clone()), args),

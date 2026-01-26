@@ -77,6 +77,7 @@ pub struct AskPassSession {
     askpass_task: PasswordProxy,
     askpass_opened_rx: Option<oneshot::Receiver<()>>,
     askpass_kill_master_rx: Option<oneshot::Receiver<()>>,
+    executor: BackgroundExecutor,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -88,7 +89,7 @@ impl AskPassSession {
     /// This will create a new AskPassSession.
     /// You must retain this session until the master process exits.
     #[must_use]
-    pub async fn new(executor: &BackgroundExecutor, mut delegate: AskPassDelegate) -> Result<Self> {
+    pub async fn new(executor: BackgroundExecutor, mut delegate: AskPassDelegate) -> Result<Self> {
         #[cfg(target_os = "windows")]
         let secret = std::sync::Arc::new(OnceLock::new());
         let (askpass_opened_tx, askpass_opened_rx) = oneshot::channel::<()>();
@@ -137,6 +138,7 @@ impl AskPassSession {
             askpass_task,
             askpass_kill_master_rx: Some(askpass_kill_master_rx),
             askpass_opened_rx: Some(askpass_opened_rx),
+            executor,
         })
     }
 
@@ -152,6 +154,7 @@ impl AskPassSession {
             .askpass_kill_master_rx
             .take()
             .expect("Only call run once");
+        let executor = self.executor.clone();
 
         select_biased! {
             _ = askpass_opened_rx.fuse() => {
@@ -160,7 +163,7 @@ impl AskPassSession {
                 AskPassResult::CancelledByUser
             }
 
-            _ = futures::FutureExt::fuse(smol::Timer::after(connection_timeout)) => {
+            _ = futures::FutureExt::fuse(executor.timer(connection_timeout)) => {
                 AskPassResult::Timedout
             }
         }
@@ -249,10 +252,15 @@ impl PasswordProxy {
         fs::write(&askpass_script_path, askpass_script)
             .await
             .with_context(|| format!("creating askpass script at {askpass_script_path:?}"))?;
-        make_file_executable(&askpass_script_path).await?;
+        make_file_executable(&askpass_script_path)
+            .await
+            .with_context(|| {
+                format!("marking askpass script executable at {askpass_script_path:?}")
+            })?;
+        // todo(shell): There might be no powershell on the system
         #[cfg(target_os = "windows")]
         let askpass_helper = format!(
-            "powershell.exe -ExecutionPolicy Bypass -File {}",
+            "powershell.exe -ExecutionPolicy Bypass -File \"{}\"",
             askpass_script_path.display()
         );
 
@@ -374,7 +382,7 @@ fn generate_askpass_script(
     Ok(format!(
         r#"
         $ErrorActionPreference = 'Stop';
-        ($args -join [char]0) | & {askpass_program} --askpass={askpass_socket} 2> $null
+        ($args -join [char]0) | {askpass_program} --askpass={askpass_socket} 2> $null
         "#,
     ))
 }

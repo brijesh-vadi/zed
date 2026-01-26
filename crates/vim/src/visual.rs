@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use collections::HashMap;
 use editor::{
-    Bias, DisplayPoint, Editor, SelectionEffects,
+    Bias, DisplayPoint, Editor, MultiBufferOffset, SelectionEffects,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement,
 };
@@ -522,12 +522,16 @@ impl Vim {
                                             selection.start = original_point.to_display_point(map)
                                         }
                                     } else {
-                                        selection.end = movement::saturating_right(
-                                            map,
-                                            original_point.to_display_point(map),
-                                        );
-                                        if original_point.column > 0 {
-                                            selection.reversed = true
+                                        let original_display_point =
+                                            original_point.to_display_point(map);
+                                        if selection.end <= original_display_point {
+                                            selection.end = movement::saturating_right(
+                                                map,
+                                                original_display_point,
+                                            );
+                                            if original_point.column > 0 {
+                                                selection.reversed = true
+                                            }
                                         }
                                     }
                                 }
@@ -778,7 +782,7 @@ impl Vim {
                     {
                         let range = row_range.start.to_offset(&display_map, Bias::Right)
                             ..row_range.end.to_offset(&display_map, Bias::Right);
-                        let text = text.repeat(range.len());
+                        let text = text.repeat(range.end - range.start);
                         edits.push((range, text));
                     }
                 }
@@ -844,8 +848,8 @@ impl Vim {
             return;
         };
         let vim_is_normal = self.mode == Mode::Normal;
-        let mut start_selection = 0usize;
-        let mut end_selection = 0usize;
+        let mut start_selection = MultiBufferOffset(0);
+        let mut end_selection = MultiBufferOffset(0);
 
         self.update_editor(cx, |_, editor, _| {
             editor.set_collapse_matches(false);
@@ -868,7 +872,7 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             let latest = editor
                 .selections
-                .newest::<usize>(&editor.display_snapshot(cx));
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
             start_selection = latest.start;
             end_selection = latest.end;
         });
@@ -891,7 +895,7 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             let latest = editor
                 .selections
-                .newest::<usize>(&editor.display_snapshot(cx));
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
             if vim_is_normal {
                 start_selection = latest.start;
                 end_selection = latest.end;

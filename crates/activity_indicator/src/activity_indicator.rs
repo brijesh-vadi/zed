@@ -234,7 +234,7 @@ impl ActivityIndicator {
                 status,
             } => {
                 let create_buffer =
-                    project.update(cx, |project, cx| project.create_buffer(false, cx));
+                    project.update(cx, |project, cx| project.create_buffer(None, false, cx));
                 let status = status.clone();
                 let server_name = server_name.clone();
                 cx.spawn_in(window, async move |workspace, cx| {
@@ -246,7 +246,7 @@ impl ActivityIndicator {
                             cx,
                         );
                         buffer.set_capability(language::Capability::ReadOnly, cx);
-                    })?;
+                    });
                     workspace.update_in(cx, |workspace, window, cx| {
                         workspace.add_item_to_active_pane(
                             Box::new(cx.new(|cx| {
@@ -925,15 +925,15 @@ impl StatusItemView for ActivityIndicator {
 
 #[cfg(test)]
 mod tests {
-    use gpui::SemanticVersion;
     use release_channel::AppCommitSha;
+    use semver::Version;
 
     use super::*;
 
     #[test]
     fn test_version_tooltip_message() {
         let message = ActivityIndicator::version_tooltip_message(&VersionCheckType::Semantic(
-            SemanticVersion::new(1, 0, 0),
+            Version::new(1, 0, 0),
         ));
 
         assert_eq!(message, "Version: 1.0.0");

@@ -4,7 +4,10 @@ use gh_workflow::{
 use indexmap::IndexMap;
 
 use crate::tasks::workflows::{
-    nix_build::build_nix, runners::Arch, steps::BASH_SHELL, vars::PathCondition,
+    nix_build::build_nix,
+    runners::Arch,
+    steps::{BASH_SHELL, CommonJobConditions, repository_owner_guard_expression},
+    vars::{self, PathCondition},
 };
 
 use super::{
@@ -22,7 +25,7 @@ pub(crate) fn run_tests() -> Workflow {
         "run_tests",
         r"^(docs/|script/update_top_ranking_issues/|\.github/(ISSUE_TEMPLATE|workflows/(?!run_tests)))",
     );
-    let should_check_docs = PathCondition::new("run_docs", r"^docs/");
+    let should_check_docs = PathCondition::new("run_docs", r"^(docs/|crates/.*\.rs)");
     let should_check_scripts = PathCondition::new(
         "run_action_checks",
         r"^\.github/(workflows/|actions/|actionlint.yml)|tooling/xtask|script/",
@@ -45,6 +48,9 @@ pub(crate) fn run_tests() -> Workflow {
     let mut jobs = vec![
         orchestrate,
         check_style(),
+        should_run_tests.guard(clippy(Platform::Windows)),
+        should_run_tests.guard(clippy(Platform::Linux)),
+        should_run_tests.guard(clippy(Platform::Mac)),
         should_run_tests.guard(run_platform_tests(Platform::Windows)),
         should_run_tests.guard(run_platform_tests(Platform::Linux)),
         should_run_tests.guard(run_platform_tests(Platform::Mac)),
@@ -107,7 +113,7 @@ pub(crate) fn run_tests() -> Workflow {
 
 // Generates a bash script that checks changed files against regex patterns
 // and sets GitHub output variables accordingly
-fn orchestrate(rules: &[&PathCondition]) -> NamedJob {
+pub fn orchestrate(rules: &[&PathCondition]) -> NamedJob {
     let name = "orchestrate".to_owned();
     let step_name = "filter".to_owned();
     let mut script = String::new();
@@ -162,9 +168,7 @@ fn orchestrate(rules: &[&PathCondition]) -> NamedJob {
 
     let job = Job::default()
         .runs_on(runners::LINUX_SMALL)
-        .cond(Expression::new(
-            "github.repository_owner == 'zed-industries'",
-        ))
+        .with_repository_owner_guard()
         .outputs(outputs)
         .add_step(steps::checkout_repo().add_with((
             "fetch-depth",
@@ -180,7 +184,7 @@ fn orchestrate(rules: &[&PathCondition]) -> NamedJob {
     NamedJob { name, job }
 }
 
-pub(crate) fn tests_pass(jobs: &[NamedJob]) -> NamedJob {
+pub fn tests_pass(jobs: &[NamedJob]) -> NamedJob {
     let mut script = String::from(indoc::indoc! {r#"
         set +x
         EXIT_CODE=0
@@ -214,9 +218,7 @@ pub(crate) fn tests_pass(jobs: &[NamedJob]) -> NamedJob {
                 .map(|j| j.name.to_string())
                 .collect::<Vec<String>>(),
         )
-        .cond(Expression::new(
-            "github.repository_owner == 'zed-industries' && always()",
-        ))
+        .cond(repository_owner_guard_expression(true))
         .add_step(named::bash(&script));
 
     named::job(job)
@@ -227,8 +229,8 @@ fn check_style() -> NamedJob {
         named::uses(
             "crate-ci",
             "typos",
-            "80c8a4945eec0f6d464eaf9e65ed98ef085283d1",
-        ) // v1.38.1
+            "2d0ce569feab1f8752f1dde43cc2f2aa53236e06",
+        ) // v1.40.0
         .with(("config", "./typos.toml"))
     }
     named::job(
@@ -237,11 +239,11 @@ fn check_style() -> NamedJob {
             .add_step(steps::checkout_repo())
             .add_step(steps::cache_rust_dependencies_namespace())
             .add_step(steps::setup_pnpm())
-            .add_step(steps::script("./script/prettier"))
+            .add_step(steps::prettier())
+            .add_step(steps::cargo_fmt())
             .add_step(steps::script("./script/check-todos"))
             .add_step(steps::script("./script/check-keymaps"))
-            .add_step(check_for_typos())
-            .add_step(steps::cargo_fmt()),
+            .add_step(check_for_typos()),
     )
 }
 
@@ -305,6 +307,29 @@ fn check_workspace_binaries() -> NamedJob {
     )
 }
 
+pub(crate) fn clippy(platform: Platform) -> NamedJob {
+    let runner = match platform {
+        Platform::Windows => runners::WINDOWS_DEFAULT,
+        Platform::Linux => runners::LINUX_DEFAULT,
+        Platform::Mac => runners::MAC_DEFAULT,
+    };
+    NamedJob {
+        name: format!("clippy_{platform}"),
+        job: release_job(&[])
+            .runs_on(runner)
+            .add_step(steps::checkout_repo())
+            .add_step(steps::setup_cargo_config(platform))
+            .when(platform == Platform::Linux, |this| {
+                this.add_step(steps::cache_rust_dependencies_namespace())
+            })
+            .when(
+                platform == Platform::Linux,
+                steps::install_linux_dependencies,
+            )
+            .add_step(steps::clippy(platform)),
+    }
+}
+
 pub(crate) fn run_platform_tests(platform: Platform) -> NamedJob {
     let runner = match platform {
         Platform::Windows => runners::WINDOWS_DEFAULT,
@@ -325,7 +350,6 @@ pub(crate) fn run_platform_tests(platform: Platform) -> NamedJob {
                 steps::install_linux_dependencies,
             )
             .add_step(steps::setup_node())
-            .add_step(steps::clippy(platform))
             .when(platform == Platform::Linux, |job| {
                 job.add_step(steps::cargo_install_nextest())
             })
@@ -354,7 +378,9 @@ pub(crate) fn check_postgres_and_protobuf_migrations() -> NamedJob {
     }
 
     fn bufbuild_setup_action() -> Step<Use> {
-        named::uses("bufbuild", "buf-setup-action", "v1").add_with(("version", "v1.29.0"))
+        named::uses("bufbuild", "buf-setup-action", "v1")
+            .add_with(("version", "v1.29.0"))
+            .add_with(("github_token", vars::GITHUB_TOKEN))
     }
 
     fn bufbuild_breaking_action() -> Step<Use> {
@@ -364,7 +390,11 @@ pub(crate) fn check_postgres_and_protobuf_migrations() -> NamedJob {
 
     named::job(
         release_job(&[])
-            .runs_on(runners::MAC_DEFAULT)
+            .runs_on(runners::LINUX_DEFAULT)
+            .add_env(("GIT_AUTHOR_NAME", "Protobuf Action"))
+            .add_env(("GIT_AUTHOR_EMAIL", "ci@zed.dev"))
+            .add_env(("GIT_COMMITTER_NAME", "Protobuf Action"))
+            .add_env(("GIT_COMMITTER_EMAIL", "ci@zed.dev"))
             .add_step(steps::checkout_repo().with(("fetch-depth", 0))) // fetch full history
             .add_step(remove_untracked_files())
             .add_step(ensure_fresh_merge())
@@ -443,6 +473,7 @@ fn check_docs() -> NamedJob {
                 lychee_link_check("./docs/src/**/*"), // check markdown links
             )
             .map(steps::install_linux_dependencies)
+            .add_step(steps::script("./script/generate-action-metadata"))
             .add_step(install_mdbook())
             .add_step(build_docs())
             .add_step(

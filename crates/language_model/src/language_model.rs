@@ -1,3 +1,4 @@
+mod api_key;
 mod model;
 mod rate_limiter;
 mod registry;
@@ -12,7 +13,7 @@ pub mod fake_provider;
 use anthropic::{AnthropicError, parse_prompt_too_long};
 use anyhow::{Result, anyhow};
 use client::Client;
-use cloud_llm_client::{CompletionMode, CompletionRequestStatus};
+use cloud_llm_client::CompletionRequestStatus;
 use futures::FutureExt;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{AnyView, App, AsyncApp, SharedString, Task, Window};
@@ -30,6 +31,7 @@ use std::{fmt, io};
 use thiserror::Error;
 use util::serde::is_default;
 
+pub use crate::api_key::{ApiKey, ApiKeyState};
 pub use crate::model::*;
 pub use crate::rate_limiter::*;
 pub use crate::registry::*;
@@ -37,6 +39,7 @@ pub use crate::request::*;
 pub use crate::role::*;
 pub use crate::telemetry::*;
 pub use crate::tool_schema::LanguageModelToolSchemaFormat;
+pub use zed_env_vars::{EnvVar, env_var};
 
 pub const ANTHROPIC_PROVIDER_ID: LanguageModelProviderId =
     LanguageModelProviderId::new("anthropic");
@@ -70,7 +73,10 @@ pub fn init_settings(cx: &mut App) {
 /// A completion event from a language model.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum LanguageModelCompletionEvent {
-    StatusUpdate(CompletionRequestStatus),
+    Queued {
+        position: usize,
+    },
+    Started,
     Stop(StopReason),
     Text(String),
     Thinking {
@@ -90,7 +96,37 @@ pub enum LanguageModelCompletionEvent {
     StartMessage {
         message_id: String,
     },
+    ReasoningDetails(serde_json::Value),
     UsageUpdate(TokenUsage),
+}
+
+impl LanguageModelCompletionEvent {
+    pub fn from_completion_request_status(
+        status: CompletionRequestStatus,
+        upstream_provider: LanguageModelProviderName,
+    ) -> Result<Self, LanguageModelCompletionError> {
+        match status {
+            CompletionRequestStatus::Queued { position } => {
+                Ok(LanguageModelCompletionEvent::Queued { position })
+            }
+            CompletionRequestStatus::Started => Ok(LanguageModelCompletionEvent::Started),
+            CompletionRequestStatus::UsageUpdated { .. }
+            | CompletionRequestStatus::ToolUseLimitReached => Err(
+                LanguageModelCompletionError::Other(anyhow!("Unexpected status: {status:?}")),
+            ),
+            CompletionRequestStatus::Failed {
+                code,
+                message,
+                request_id: _,
+                retry_after,
+            } => Err(LanguageModelCompletionError::from_cloud_failure(
+                upstream_provider,
+                code,
+                message,
+                retry_after.map(Duration::from_secs_f64),
+            )),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -515,6 +551,9 @@ pub struct LanguageModelToolUse {
     pub raw_input: String,
     pub input: serde_json::Value,
     pub is_input_complete: bool,
+    /// Thought signature the model sent us. Some models require that this
+    /// signature be preserved and sent back in conversation history for validation.
+    pub thought_signature: Option<String>,
 }
 
 pub struct LanguageModelTextStream {
@@ -552,6 +591,11 @@ pub trait LanguageModel: Send + Sync {
         None
     }
 
+    /// Whether this model supports extended thinking.
+    fn supports_thinking(&self) -> bool {
+        false
+    }
+
     /// Whether this model supports images
     fn supports_images(&self) -> bool;
 
@@ -561,8 +605,14 @@ pub trait LanguageModel: Send + Sync {
     /// Whether this model supports choosing which tool to use.
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool;
 
-    /// Returns whether this model supports "burn mode";
-    fn supports_burn_mode(&self) -> bool {
+    /// Returns whether this model or provider supports streaming tool calls;
+    fn supports_streaming_tools(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this model/provider reports accurate split input/output token counts.
+    /// When true, the UI may show separate input/output token indicators.
+    fn supports_split_token_display(&self) -> bool {
         false
     }
 
@@ -571,10 +621,6 @@ pub trait LanguageModel: Send + Sync {
     }
 
     fn max_token_count(&self) -> u64;
-    /// Returns the maximum token count for this model in burn mode (If `supports_burn_mode` is `false` this returns `None`)
-    fn max_token_count_in_burn_mode(&self) -> Option<u64> {
-        None
-    }
     fn max_output_tokens(&self) -> Option<u64> {
         None
     }
@@ -630,11 +676,13 @@ pub trait LanguageModel: Send + Sync {
                         let last_token_usage = last_token_usage.clone();
                         async move {
                             match result {
-                                Ok(LanguageModelCompletionEvent::StatusUpdate { .. }) => None,
+                                Ok(LanguageModelCompletionEvent::Queued { .. }) => None,
+                                Ok(LanguageModelCompletionEvent::Started) => None,
                                 Ok(LanguageModelCompletionEvent::StartMessage { .. }) => None,
                                 Ok(LanguageModelCompletionEvent::Text(text)) => Some(Ok(text)),
                                 Ok(LanguageModelCompletionEvent::Thinking { .. }) => None,
                                 Ok(LanguageModelCompletionEvent::RedactedThinking { .. }) => None,
+                                Ok(LanguageModelCompletionEvent::ReasoningDetails(_)) => None,
                                 Ok(LanguageModelCompletionEvent::Stop(_)) => None,
                                 Ok(LanguageModelCompletionEvent::ToolUse(_)) => None,
                                 Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
@@ -660,6 +708,40 @@ pub trait LanguageModel: Send + Sync {
         .boxed()
     }
 
+    fn stream_completion_tool(
+        &self,
+        request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<LanguageModelToolUse, LanguageModelCompletionError>> {
+        let future = self.stream_completion(request, cx);
+
+        async move {
+            let events = future.await?;
+            let mut events = events.fuse();
+
+            // Iterate through events until we find a complete ToolUse
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(LanguageModelCompletionEvent::ToolUse(tool_use))
+                        if tool_use.is_input_complete =>
+                    {
+                        return Ok(tool_use);
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Stream ended without a complete tool use
+            Err(LanguageModelCompletionError::Other(anyhow::anyhow!(
+                "Stream ended without receiving a complete tool use"
+            )))
+        }
+        .boxed()
+    }
+
     fn cache_configuration(&self) -> Option<LanguageModelCacheConfiguration> {
         None
     }
@@ -670,17 +752,20 @@ pub trait LanguageModel: Send + Sync {
     }
 }
 
-pub trait LanguageModelExt: LanguageModel {
-    fn max_token_count_for_mode(&self, mode: CompletionMode) -> u64 {
-        match mode {
-            CompletionMode::Normal => self.max_token_count(),
-            CompletionMode::Max => self
-                .max_token_count_in_burn_mode()
-                .unwrap_or_else(|| self.max_token_count()),
-        }
+impl std::fmt::Debug for dyn LanguageModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("<dyn LanguageModel>")
+            .field("id", &self.id())
+            .field("name", &self.name())
+            .field("provider_id", &self.provider_id())
+            .field("provider_name", &self.provider_name())
+            .field("upstream_provider_name", &self.upstream_provider_name())
+            .field("upstream_provider_id", &self.upstream_provider_id())
+            .field("upstream_provider_id", &self.upstream_provider_id())
+            .field("supports_streaming_tools", &self.supports_streaming_tools())
+            .finish()
     }
 }
-impl LanguageModelExt for dyn LanguageModel {}
 
 /// An error that occurred when trying to authenticate the language model provider.
 #[derive(Debug, Error)]
@@ -693,11 +778,26 @@ pub enum AuthenticateError {
     Other(#[from] anyhow::Error),
 }
 
+/// Either a built-in icon name or a path to an external SVG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconOrSvg {
+    /// A built-in icon from Zed's icon set.
+    Icon(IconName),
+    /// Path to a custom SVG icon file.
+    Svg(SharedString),
+}
+
+impl Default for IconOrSvg {
+    fn default() -> Self {
+        Self::Icon(IconName::ZedAssistant)
+    }
+}
+
 pub trait LanguageModelProvider: 'static {
     fn id(&self) -> LanguageModelProviderId;
     fn name(&self) -> LanguageModelProviderName;
-    fn icon(&self) -> IconName {
-        IconName::ZedAssistant
+    fn icon(&self) -> IconOrSvg {
+        IconOrSvg::default()
     }
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>>;
     fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>>;
@@ -716,7 +816,7 @@ pub trait LanguageModelProvider: 'static {
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>>;
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub enum ConfigurationViewTargetAgent {
     #[default]
     ZedAgent,
@@ -920,5 +1020,86 @@ mod tests {
                 error
             ),
         }
+    }
+
+    #[test]
+    fn test_language_model_tool_use_serializes_with_signature() {
+        use serde_json::json;
+
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("test_id"),
+            name: "test_tool".into(),
+            raw_input: json!({"arg": "value"}).to_string(),
+            input: json!({"arg": "value"}),
+            is_input_complete: true,
+            thought_signature: Some("test_signature".to_string()),
+        };
+
+        let serialized = serde_json::to_value(&tool_use).unwrap();
+
+        assert_eq!(serialized["id"], "test_id");
+        assert_eq!(serialized["name"], "test_tool");
+        assert_eq!(serialized["thought_signature"], "test_signature");
+    }
+
+    #[test]
+    fn test_language_model_tool_use_deserializes_with_missing_signature() {
+        use serde_json::json;
+
+        let json = json!({
+            "id": "test_id",
+            "name": "test_tool",
+            "raw_input": "{\"arg\":\"value\"}",
+            "input": {"arg": "value"},
+            "is_input_complete": true
+        });
+
+        let tool_use: LanguageModelToolUse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(tool_use.id, LanguageModelToolUseId::from("test_id"));
+        assert_eq!(tool_use.name.as_ref(), "test_tool");
+        assert_eq!(tool_use.thought_signature, None);
+    }
+
+    #[test]
+    fn test_language_model_tool_use_round_trip_with_signature() {
+        use serde_json::json;
+
+        let original = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("round_trip_id"),
+            name: "round_trip_tool".into(),
+            raw_input: json!({"key": "value"}).to_string(),
+            input: json!({"key": "value"}),
+            is_input_complete: true,
+            thought_signature: Some("round_trip_sig".to_string()),
+        };
+
+        let serialized = serde_json::to_value(&original).unwrap();
+        let deserialized: LanguageModelToolUse = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(deserialized.id, original.id);
+        assert_eq!(deserialized.name, original.name);
+        assert_eq!(deserialized.thought_signature, original.thought_signature);
+    }
+
+    #[test]
+    fn test_language_model_tool_use_round_trip_without_signature() {
+        use serde_json::json;
+
+        let original = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("no_sig_id"),
+            name: "no_sig_tool".into(),
+            raw_input: json!({"arg": "value"}).to_string(),
+            input: json!({"arg": "value"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let serialized = serde_json::to_value(&original).unwrap();
+        let deserialized: LanguageModelToolUse = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(deserialized.id, original.id);
+        assert_eq!(deserialized.name, original.name);
+        assert_eq!(deserialized.thought_signature, None);
     }
 }

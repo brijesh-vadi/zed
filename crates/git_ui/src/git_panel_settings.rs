@@ -25,6 +25,7 @@ pub struct GitPanelSettings {
     pub sort_by_path: bool,
     pub collapse_untracked_diff: bool,
     pub single_file_diff_on_click: bool,
+    pub tree_view: bool,
 }
 
 impl ScrollbarVisibility for GitPanelSettings {
@@ -58,6 +59,7 @@ impl Settings for GitPanelSettings {
             sort_by_path: git_panel.sort_by_path.unwrap(),
             collapse_untracked_diff: git_panel.collapse_untracked_diff.unwrap(),
             single_file_diff_on_click: git_panel.single_file_diff_on_click.unwrap(),
+            tree_view: git_panel.tree_view.unwrap(),
         }
     }
 }
