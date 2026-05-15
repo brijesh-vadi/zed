@@ -1,3 +1,4 @@
+#[cfg(feature = "predict-edits")]
 pub mod predict_edits_v3;
 
 use std::str::FromStr;
@@ -10,6 +11,9 @@ use uuid::Uuid;
 
 /// The name of the header used to indicate which version of Zed the client is running.
 pub const ZED_VERSION_HEADER_NAME: &str = "x-zed-version";
+
+/// The name of the header used to indicate which edit prediction experiment should be used.
+pub const PREFERRED_EXPERIMENT_HEADER_NAME: &str = "x-zed-preferred-experiment";
 
 /// The name of the header used to indicate when a request failed due to an
 /// expired LLM token.
@@ -43,6 +47,10 @@ pub const MINIMUM_REQUIRED_VERSION_HEADER_NAME: &str = "x-zed-minimum-required-v
 pub const CLIENT_SUPPORTS_STATUS_MESSAGES_HEADER_NAME: &str =
     "x-zed-client-supports-status-messages";
 
+/// The name of the header used by the client to indicate to the server that it supports receiving a "stream_ended" request completion status.
+pub const CLIENT_SUPPORTS_STATUS_STREAM_ENDED_HEADER_NAME: &str =
+    "x-zed-client-supports-stream-ended-request-completion-status";
+
 /// The name of the header used by the server to indicate to the client that it supports sending status messages.
 pub const SERVER_SUPPORTS_STATUS_MESSAGES_HEADER_NAME: &str =
     "x-zed-server-supports-status-messages";
@@ -70,39 +78,6 @@ impl FromStr for UsageLimit {
                 .parse::<i32>()
                 .map(Self::Limited)
                 .context("failed to parse limit"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Plan {
-    V2(PlanV2),
-}
-
-impl Plan {
-    pub fn is_v2(&self) -> bool {
-        matches!(self, Self::V2(_))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanV2 {
-    #[default]
-    ZedFree,
-    ZedPro,
-    ZedProTrial,
-}
-
-impl FromStr for PlanV2 {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "zed_free" => Ok(Self::ZedFree),
-            "zed_pro" => Ok(Self::ZedPro),
-            "zed_pro_trial" => Ok(Self::ZedProTrial),
-            plan => Err(anyhow::anyhow!("invalid plan: {plan:?}")),
         }
     }
 }
@@ -140,8 +115,12 @@ pub struct PredictEditsBody {
     pub trigger: PredictEditsRequestTrigger,
 }
 
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(
+    Default, Debug, Clone, Copy, Serialize, Deserialize, strum::AsRefStr, strum::EnumString,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum PredictEditsRequestTrigger {
+    Testing,
     Diagnostics,
     Cli,
     #[default]
@@ -170,6 +149,10 @@ pub struct PredictEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptEditPredictionBody {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e_latency_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,9 +171,16 @@ pub struct EditPredictionRejection {
     #[serde(default)]
     pub reason: EditPredictionRejectReason,
     pub was_shown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e_latency_ms: Option<u128>,
 }
 
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(
+    Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, strum::AsRefStr,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum EditPredictionRejectReason {
     /// New requests were triggered before this one completed
     Canceled,
@@ -205,20 +195,8 @@ pub enum EditPredictionRejectReason {
     /// The current prediction was discarded
     #[default]
     Discarded,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletionIntent {
-    UserPrompt,
-    ToolResults,
-    ThreadSummarization,
-    ThreadContextSummarization,
-    CreateFile,
-    EditFile,
-    InlineAssist,
-    TerminalInlineAssist,
-    GenerateGitCommitMessage,
+    /// The current prediction was explicitly rejected by the user
+    Rejected,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -227,8 +205,6 @@ pub struct CompletionBody {
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub prompt_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub intent: Option<CompletionIntent>,
     pub provider: LanguageModelProvider,
     pub model: String,
     pub provider_request: serde_json::Value,
@@ -248,11 +224,10 @@ pub enum CompletionRequestStatus {
         /// Retry duration in seconds.
         retry_after: Option<f64>,
     },
-    UsageUpdated {
-        amount: usize,
-        limit: UsageLimit,
-    },
-    ToolUseLimitReached,
+    /// The cloud sends a StreamEnded message when the stream from the LLM provider finishes.
+    StreamEnded,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -295,18 +270,6 @@ pub struct WebSearchResult {
     pub text: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct CountTokensBody {
-    pub provider: LanguageModelProvider,
-    pub model: String,
-    pub provider_request: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct CountTokensResponse {
-    pub tokens: usize,
-}
-
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct LanguageModelId(pub Arc<str>);
 
@@ -321,6 +284,8 @@ pub struct LanguageModel {
     pub provider: LanguageModelProvider,
     pub id: LanguageModelId,
     pub display_name: String,
+    #[serde(default)]
+    pub is_latest: bool,
     pub max_token_count: usize,
     pub max_token_count_in_max_mode: Option<usize>,
     pub max_output_tokens: usize,
@@ -328,10 +293,21 @@ pub struct LanguageModel {
     pub supports_images: bool,
     pub supports_thinking: bool,
     #[serde(default)]
+    pub supports_fast_mode: bool,
+    pub supported_effort_levels: Vec<SupportedEffortLevel>,
+    #[serde(default)]
     pub supports_streaming_tools: bool,
     /// Only used by OpenAI and xAI.
     #[serde(default)]
     pub supports_parallel_tool_calls: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupportedEffortLevel {
+    pub name: Arc<str>,
+    pub value: Arc<str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -355,22 +331,7 @@ pub struct UsageData {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-
     use super::*;
-
-    #[test]
-    fn test_plan_v2_deserialize_snake_case() {
-        let plan = serde_json::from_value::<PlanV2>(json!("zed_free")).unwrap();
-        assert_eq!(plan, PlanV2::ZedFree);
-
-        let plan = serde_json::from_value::<PlanV2>(json!("zed_pro")).unwrap();
-        assert_eq!(plan, PlanV2::ZedPro);
-
-        let plan = serde_json::from_value::<PlanV2>(json!("zed_pro_trial")).unwrap();
-        assert_eq!(plan, PlanV2::ZedProTrial);
-    }
 
     #[test]
     fn test_usage_limit_from_str() {

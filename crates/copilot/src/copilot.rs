@@ -24,9 +24,9 @@ use language::{
 use lsp::{LanguageServer, LanguageServerBinary, LanguageServerId, LanguageServerName};
 use node_runtime::{NodeRuntime, VersionStrategy};
 use parking_lot::Mutex;
+use project::project_settings::ProjectSettings;
 use project::{DisableAiSettings, Project};
 use request::DidChangeStatus;
-use semver::Version;
 use serde_json::json;
 use settings::{Settings, SettingsStore};
 use std::{
@@ -271,27 +271,35 @@ impl GlobalCopilotAuth {
         fs: Arc<dyn Fs>,
         node_runtime: NodeRuntime,
         cx: &mut App,
-    ) {
+    ) -> GlobalCopilotAuth {
         let auth =
             GlobalCopilotAuth(cx.new(|cx| Copilot::new(None, server_id, fs, node_runtime, cx)));
-        cx.set_global(auth);
+        cx.set_global(auth.clone());
+        auth
     }
     pub fn try_global(cx: &mut App) -> Option<&GlobalCopilotAuth> {
         cx.try_global()
     }
 
-    pub fn get_or_init(cx: &mut App) -> Option<GlobalCopilotAuth> {
-        if let Some(copilot) = cx.try_global::<Self>() {
-            Some(copilot.clone())
-        } else {
-            let app_state = AppState::global(cx).upgrade()?;
-            Self::set_global(
+    pub fn try_get_or_init(app_state: Arc<AppState>, cx: &mut App) -> Option<GlobalCopilotAuth> {
+        let ai_enabled = !DisableAiSettings::get(None, cx).disable_ai;
+
+        if let Some(copilot) = cx.try_global::<Self>().cloned() {
+            if ai_enabled {
+                Some(copilot)
+            } else {
+                cx.remove_global::<Self>();
+                None
+            }
+        } else if ai_enabled {
+            Some(Self::set_global(
                 app_state.languages.next_language_server_id(),
                 app_state.fs.clone(),
                 app_state.node_runtime.clone(),
                 cx,
-            );
-            cx.try_global::<Self>().cloned()
+            ))
+        } else {
+            None
         }
     }
 }
@@ -339,6 +347,9 @@ impl Copilot {
         let global_authentication_events =
             cx.try_global::<GlobalCopilotAuth>().cloned().map(|auth| {
                 cx.subscribe(&auth.0, |_, _, _: &Event, cx| {
+                    let request_timeout = ProjectSettings::get_global(cx)
+                        .global_lsp_settings
+                        .get_request_timeout();
                     cx.spawn(async move |this, cx| {
                         let Some(server) = this
                             .update(cx, |this, _| this.language_server().cloned())
@@ -348,9 +359,12 @@ impl Copilot {
                             return;
                         };
                         let status = server
-                            .request::<request::CheckStatus>(request::CheckStatusParams {
-                                local_checks_only: false,
-                            })
+                            .request::<request::CheckStatus>(
+                                request::CheckStatusParams {
+                                    local_checks_only: false,
+                                },
+                                request_timeout,
+                            )
                             .await
                             .into_response()
                             .ok();
@@ -378,11 +392,35 @@ impl Copilot {
         };
         this.start_copilot(true, false, cx);
         cx.observe_global::<SettingsStore>(move |this, cx| {
-            this.start_copilot(true, false, cx);
-            if let Ok(server) = this.server.as_running() {
-                notify_did_change_config_to_server(&server.lsp, cx)
-                    .context("copilot setting change: did change configuration")
-                    .log_err();
+            let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
+
+            if ai_disabled {
+                // Stop the server if AI is disabled
+                if !matches!(this.server, CopilotServer::Disabled) {
+                    let shutdown = match mem::replace(&mut this.server, CopilotServer::Disabled) {
+                        CopilotServer::Running(server) => {
+                            let shutdown_future = server.lsp.shutdown();
+                            Some(cx.background_spawn(async move {
+                                if let Some(fut) = shutdown_future {
+                                    fut.await;
+                                }
+                            }))
+                        }
+                        _ => None,
+                    };
+                    if let Some(task) = shutdown {
+                        task.detach();
+                    }
+                    cx.notify();
+                }
+            } else {
+                // Only start if AI is enabled
+                this.start_copilot(true, false, cx);
+                if let Ok(server) = this.server.as_running() {
+                    notify_did_change_config_to_server(&server.lsp, cx)
+                        .context("copilot setting change: did change configuration")
+                        .log_err();
+                }
             }
             this.update_action_visibilities(cx);
         })
@@ -416,6 +454,9 @@ impl Copilot {
         awaiting_sign_in_after_start: bool,
         cx: &mut Context<Self>,
     ) {
+        if DisableAiSettings::get_global(cx).disable_ai {
+            return;
+        }
         if !matches!(self.server, CopilotServer::Disabled) {
             return;
         }
@@ -525,17 +566,11 @@ impl Copilot {
         cx: &mut AsyncApp,
     ) {
         let start_language_server = async {
-            let server_path = get_copilot_lsp(fs, node_runtime.clone()).await?;
-            let node_path = node_runtime.binary_path().await?;
-            ensure_node_version_for_copilot(&node_path).await?;
+            let server_path = get_copilot_lsp(fs, node_runtime).await?;
 
-            let arguments: Vec<OsString> = vec![
-                "--experimental-sqlite".into(),
-                server_path.into(),
-                "--stdio".into(),
-            ];
+            let arguments: Vec<OsString> = vec!["--stdio".into()];
             let binary = LanguageServerBinary {
-                path: node_path,
+                path: server_path,
                 arguments,
                 env,
             };
@@ -576,10 +611,18 @@ impl Copilot {
                                     .ok()
                                     .flatten();
                                 let Some(lsp) = lsp else { return };
+                                let request_timeout = cx.update(|cx| {
+                                    ProjectSettings::get_global(cx)
+                                        .global_lsp_settings
+                                        .get_request_timeout()
+                                });
                                 let status = lsp
-                                    .request::<request::CheckStatus>(request::CheckStatusParams {
-                                        local_checks_only: false,
-                                    })
+                                    .request::<request::CheckStatus>(
+                                        request::CheckStatusParams {
+                                            local_checks_only: false,
+                                        },
+                                        request_timeout,
+                                    )
                                     .await
                                     .into_response()
                                     .ok();
@@ -622,9 +665,15 @@ impl Copilot {
             };
             let editor_info_json = serde_json::to_value(&editor_info)?;
 
+            let request_timeout = cx.update(|app| {
+                ProjectSettings::get_global(app)
+                    .global_lsp_settings
+                    .get_request_timeout()
+            });
+
             let server = cx
                 .update(|cx| {
-                    let mut params = server.default_initialize_params(false, cx);
+                    let mut params = server.default_initialize_params(false, false, cx);
                     params.initialization_options = Some(editor_info_json);
                     params
                         .capabilities
@@ -632,7 +681,7 @@ impl Copilot {
                         .get_or_insert_with(Default::default)
                         .show_document =
                         Some(lsp::ShowDocumentClientCapabilities { support: true });
-                    server.initialize(params, configuration.into(), cx)
+                    server.initialize(params, configuration.into(), request_timeout, cx)
                 })
                 .await?;
 
@@ -640,9 +689,12 @@ impl Copilot {
                 .context("copilot: did change configuration")?;
 
             let status = server
-                .request::<request::CheckStatus>(request::CheckStatusParams {
-                    local_checks_only: false,
-                })
+                .request::<request::CheckStatus>(
+                    request::CheckStatusParams {
+                        local_checks_only: false,
+                    },
+                    request_timeout,
+                )
                 .await
                 .into_response()
                 .context("copilot: check status")?;
@@ -702,11 +754,18 @@ impl Copilot {
                 SignInStatus::SignedOut { .. } | SignInStatus::Unauthorized => {
                     let lsp = server.lsp.clone();
 
+                    let request_timeout = ProjectSettings::get_global(cx)
+                        .global_lsp_settings
+                        .get_request_timeout();
+
                     let task = cx
                         .spawn(async move |this, cx| {
                             let sign_in = async {
                                 let flow = lsp
-                                    .request::<request::SignIn>(request::SignInParams {})
+                                    .request::<request::SignIn>(
+                                        request::SignInParams {},
+                                        request_timeout,
+                                    )
                                     .await
                                     .into_response()
                                     .context("copilot sign-in")?;
@@ -763,10 +822,14 @@ impl Copilot {
         self.update_sign_in_status(request::SignInStatus::NotSignedIn, cx);
         match &self.server {
             CopilotServer::Running(RunningCopilotServer { lsp: server, .. }) => {
+                let request_timeout = ProjectSettings::get_global(cx)
+                    .global_lsp_settings
+                    .get_request_timeout();
+
                 let server = server.clone();
                 cx.background_spawn(async move {
                     server
-                        .request::<request::SignOut>(request::SignOutParams {})
+                        .request::<request::SignOut>(request::SignOutParams {}, request_timeout)
                         .await
                         .into_response()
                         .context("copilot: sign in confirm")?;
@@ -879,7 +942,7 @@ impl Copilot {
             && let Some(registered_buffer) = server.registered_buffers.get_mut(&buffer.entity_id())
         {
             match event {
-                language::BufferEvent::Edited => {
+                language::BufferEvent::Edited { .. } => {
                     drop(registered_buffer.report_changes(&buffer, cx));
                 }
                 language::BufferEvent::Saved => {
@@ -965,10 +1028,9 @@ impl Copilot {
         };
         let buffer_entity = buffer.clone();
         let lsp = server.lsp.clone();
-        let registered_buffer = server
-            .registered_buffers
-            .get_mut(&buffer.entity_id())
-            .unwrap();
+        let Some(registered_buffer) = server.registered_buffers.get_mut(&buffer.entity_id()) else {
+            return Task::ready(Err(anyhow::anyhow!("buffer not registered")));
+        };
         let pending_snapshot = registered_buffer.report_changes(buffer, cx);
         let buffer = buffer.read(cx);
         let uri = registered_buffer.uri.clone();
@@ -978,6 +1040,10 @@ impl Copilot {
         let tab_size = settings.tab_size.get();
         let hard_tabs = settings.hard_tabs;
         drop(settings);
+
+        let request_timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
 
         let nes_enabled = AllLanguageSettings::get_global(cx)
             .edit_predictions
@@ -990,13 +1056,16 @@ impl Copilot {
             let lsp_position = point_to_lsp(position);
 
             let nes_fut = if nes_enabled {
-                lsp.request::<NextEditSuggestions>(request::NextEditSuggestionsParams {
-                    text_document: lsp::VersionedTextDocumentIdentifier {
-                        uri: uri.clone(),
-                        version,
+                lsp.request::<NextEditSuggestions>(
+                    request::NextEditSuggestionsParams {
+                        text_document: lsp::VersionedTextDocumentIdentifier {
+                            uri: uri.clone(),
+                            version,
+                        },
+                        position: lsp_position,
                     },
-                    position: lsp_position,
-                })
+                    request_timeout,
+                )
                 .map(|resp| {
                     resp.into_response()
                         .ok()
@@ -1036,20 +1105,23 @@ impl Copilot {
             };
 
             let inline_fut = lsp
-                .request::<InlineCompletions>(request::InlineCompletionsParams {
-                    text_document: lsp::VersionedTextDocumentIdentifier {
-                        uri: uri.clone(),
-                        version,
+                .request::<InlineCompletions>(
+                    request::InlineCompletionsParams {
+                        text_document: lsp::VersionedTextDocumentIdentifier {
+                            uri: uri.clone(),
+                            version,
+                        },
+                        position: lsp_position,
+                        context: InlineCompletionContext {
+                            trigger_kind: InlineCompletionTriggerKind::Automatic,
+                        },
+                        formatting_options: Some(FormattingOptions {
+                            tab_size,
+                            insert_spaces: !hard_tabs,
+                        }),
                     },
-                    position: lsp_position,
-                    context: InlineCompletionContext {
-                        trigger_kind: InlineCompletionTriggerKind::Automatic,
-                    },
-                    formatting_options: Some(FormattingOptions {
-                        tab_size,
-                        insert_spaces: !hard_tabs,
-                    }),
-                })
+                    request_timeout,
+                )
                 .map(|resp| {
                     resp.into_response()
                         .ok()
@@ -1127,13 +1199,18 @@ impl Copilot {
             Err(error) => return Task::ready(Err(error)),
         };
         if let Some(command) = &completion.command {
-            let request = server
-                .lsp
-                .request::<lsp::ExecuteCommand>(lsp::ExecuteCommandParams {
+            let request_timeout = ProjectSettings::get_global(cx)
+                .global_lsp_settings
+                .get_request_timeout();
+
+            let request = server.lsp.request::<lsp::ExecuteCommand>(
+                lsp::ExecuteCommandParams {
                     command: command.command.clone(),
                     arguments: command.arguments.clone().unwrap_or_default(),
                     ..Default::default()
-                });
+                },
+                request_timeout,
+            );
             cx.background_spawn(async move {
                 request
                     .await
@@ -1312,44 +1389,6 @@ async fn clear_copilot_config_dir() {
     remove_matching(copilot_chat::copilot_chat_config_dir(), |_| true).await
 }
 
-async fn ensure_node_version_for_copilot(node_path: &Path) -> anyhow::Result<()> {
-    const MIN_COPILOT_NODE_VERSION: Version = Version::new(20, 8, 0);
-
-    log::info!("Checking Node.js version for Copilot at: {:?}", node_path);
-
-    let output = util::command::new_smol_command(node_path)
-        .arg("--version")
-        .output()
-        .await
-        .with_context(|| format!("checking Node.js version at {:?}", node_path))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to run node --version for Copilot. stdout: {}, stderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    let version_str = String::from_utf8_lossy(&output.stdout);
-    let version = Version::parse(version_str.trim().trim_start_matches('v'))
-        .with_context(|| format!("parsing Node.js version from '{}'", version_str.trim()))?;
-
-    if version < MIN_COPILOT_NODE_VERSION {
-        anyhow::bail!(
-            "GitHub Copilot language server requires Node.js {MIN_COPILOT_NODE_VERSION} or later, but found {version}. \
-            Please update your Node.js version or configure a different Node.js path in settings."
-        );
-    }
-
-    log::info!(
-        "Node.js version {} meets Copilot requirements (>= {})",
-        version,
-        MIN_COPILOT_NODE_VERSION
-    );
-    Ok(())
-}
-
 async fn get_copilot_lsp(fs: Arc<dyn Fs>, node_runtime: NodeRuntime) -> anyhow::Result<PathBuf> {
     const PACKAGE_NAME: &str = "@github/copilot-language-server";
     const SERVER_PATH: &str =
@@ -1359,17 +1398,19 @@ async fn get_copilot_lsp(fs: Arc<dyn Fs>, node_runtime: NodeRuntime) -> anyhow::
         .npm_package_latest_version(PACKAGE_NAME)
         .await?;
     let server_path = paths::copilot_dir().join(SERVER_PATH);
+    let binary_path = copilot_lsp_native_binary_path()?;
 
     fs.create_dir(paths::copilot_dir()).await?;
 
-    let should_install = node_runtime
-        .should_install_npm_package(
-            PACKAGE_NAME,
-            &server_path,
-            paths::copilot_dir(),
-            VersionStrategy::Latest(&latest_version),
-        )
-        .await;
+    let should_install = !fs.is_file(&binary_path).await
+        || node_runtime
+            .should_install_npm_package(
+                PACKAGE_NAME,
+                &server_path,
+                paths::copilot_dir(),
+                VersionStrategy::Latest(&latest_version),
+            )
+            .await;
     if should_install {
         node_runtime
             .npm_install_packages(
@@ -1379,21 +1420,162 @@ async fn get_copilot_lsp(fs: Arc<dyn Fs>, node_runtime: NodeRuntime) -> anyhow::
             .await?;
     }
 
-    Ok(server_path)
+    if fs.is_file(&binary_path).await {
+        return Ok(binary_path);
+    }
+
+    anyhow::bail!("GitHub Copilot native language server binary was not installed")
+}
+
+fn copilot_lsp_native_binary_path() -> anyhow::Result<PathBuf> {
+    let platform = match env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win32",
+        platform => anyhow::bail!("unsupported Copilot language server platform: {platform}"),
+    };
+    let architecture = match env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        architecture => {
+            anyhow::bail!("unsupported Copilot language server architecture: {architecture}")
+        }
+    };
+
+    let package_name = format!("copilot-language-server-{platform}-{architecture}");
+
+    let executable_name = if cfg!(target_os = "windows") {
+        "copilot-language-server.exe"
+    } else {
+        "copilot-language-server"
+    };
+    Ok(paths::copilot_dir()
+        .join("node_modules")
+        .join("@github")
+        .join(package_name)
+        .join(executable_name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::FakeFs;
     use gpui::TestAppContext;
+    use language::language_settings::AllLanguageSettings;
+    use node_runtime::NodeRuntime;
+    use settings::{Settings, SettingsStore};
     use util::{
         path,
         paths::PathStyle,
         rel_path::{RelPath, rel_path},
     };
 
+    #[gpui::test]
+    async fn test_copilot_does_not_start_when_ai_disabled(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            DisableAiSettings::register(cx);
+            AllLanguageSettings::register(cx);
+
+            // Set disable_ai to true before creating Copilot
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+        });
+
+        let copilot = cx.new(|cx| Copilot {
+            server_id: LanguageServerId(0),
+            fs: FakeFs::new(cx.background_executor().clone()),
+            node_runtime: NodeRuntime::unavailable(),
+            server: CopilotServer::Disabled,
+            buffers: Default::default(),
+            _subscriptions: vec![],
+        });
+
+        // Try to start copilot - it should remain disabled
+        copilot.update(cx, |copilot, cx| {
+            copilot.start_copilot(false, false, cx);
+        });
+
+        // Verify the server is still disabled
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Disabled),
+                "Copilot should not start when disable_ai is true"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_copilot_stops_when_ai_becomes_disabled(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            DisableAiSettings::register(cx);
+            AllLanguageSettings::register(cx);
+
+            // AI is initially enabled
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: false }, cx);
+        });
+
+        // Create a fake Copilot that's already running, with the settings observer
+        let (copilot, _lsp) = Copilot::fake(cx);
+
+        // Add the settings observer that handles disable_ai changes
+        copilot.update(cx, |_, cx| {
+            cx.observe_global::<SettingsStore>(move |this, cx| {
+                let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
+
+                if ai_disabled {
+                    if !matches!(this.server, CopilotServer::Disabled) {
+                        let shutdown = match mem::replace(&mut this.server, CopilotServer::Disabled)
+                        {
+                            CopilotServer::Running(server) => {
+                                let shutdown_future = server.lsp.shutdown();
+                                Some(cx.background_spawn(async move {
+                                    if let Some(fut) = shutdown_future {
+                                        fut.await;
+                                    }
+                                }))
+                            }
+                            _ => None,
+                        };
+                        if let Some(task) = shutdown {
+                            task.detach();
+                        }
+                        cx.notify();
+                    }
+                }
+            })
+            .detach();
+        });
+
+        // Verify copilot is running
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Running(_)),
+                "Copilot should be running initially"
+            );
+        });
+
+        // Now disable AI
+        cx.update(|cx| {
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+        });
+
+        // The settings observer should have stopped the server
+        cx.run_until_parked();
+
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Disabled),
+                "Copilot should be disabled after disable_ai is set to true"
+            );
+        });
+    }
+
     #[gpui::test(iterations = 10)]
     async fn test_buffer_management(cx: &mut TestAppContext) {
+        init_test(cx);
         let (copilot, mut lsp) = Copilot::fake(cx);
 
         let buffer_1 = cx.new(|cx| Buffer::local("Hello", cx));
@@ -1488,19 +1670,24 @@ mod tests {
             .update(cx, |copilot, cx| copilot.sign_out(cx))
             .await
             .unwrap();
-        assert_eq!(
+        let mut received_close_notifications = vec![
             lsp.receive_notification::<lsp::notification::DidCloseTextDocument>()
                 .await,
-            lsp::DidCloseTextDocumentParams {
-                text_document: lsp::TextDocumentIdentifier::new(buffer_1_uri.clone()),
-            }
-        );
-        assert_eq!(
             lsp.receive_notification::<lsp::notification::DidCloseTextDocument>()
                 .await,
-            lsp::DidCloseTextDocumentParams {
-                text_document: lsp::TextDocumentIdentifier::new(buffer_2_uri.clone()),
-            }
+        ];
+        received_close_notifications
+            .sort_by_key(|notification| notification.text_document.uri.clone());
+        assert_eq!(
+            received_close_notifications,
+            vec![
+                lsp::DidCloseTextDocumentParams {
+                    text_document: lsp::TextDocumentIdentifier::new(buffer_2_uri.clone()),
+                },
+                lsp::DidCloseTextDocumentParams {
+                    text_document: lsp::TextDocumentIdentifier::new(buffer_1_uri.clone()),
+                },
+            ],
         );
 
         // Ensure all previously-registered buffers are re-opened when signing in.
@@ -1529,29 +1716,34 @@ mod tests {
             );
         });
 
-        assert_eq!(
+        let mut received_open_notifications = vec![
             lsp.receive_notification::<lsp::notification::DidOpenTextDocument>()
                 .await,
-            lsp::DidOpenTextDocumentParams {
-                text_document: lsp::TextDocumentItem::new(
-                    buffer_1_uri.clone(),
-                    "plaintext".into(),
-                    0,
-                    "Hello world".into()
-                ),
-            }
-        );
-        assert_eq!(
             lsp.receive_notification::<lsp::notification::DidOpenTextDocument>()
                 .await,
-            lsp::DidOpenTextDocumentParams {
-                text_document: lsp::TextDocumentItem::new(
-                    buffer_2_uri.clone(),
-                    "plaintext".into(),
-                    0,
-                    "Goodbye".into()
-                ),
-            }
+        ];
+        received_open_notifications
+            .sort_by_key(|notification| notification.text_document.uri.clone());
+        assert_eq!(
+            received_open_notifications,
+            vec![
+                lsp::DidOpenTextDocumentParams {
+                    text_document: lsp::TextDocumentItem::new(
+                        buffer_2_uri.clone(),
+                        "plaintext".into(),
+                        0,
+                        "Goodbye".into()
+                    ),
+                },
+                lsp::DidOpenTextDocumentParams {
+                    text_document: lsp::TextDocumentItem::new(
+                        buffer_1_uri.clone(),
+                        "plaintext".into(),
+                        0,
+                        "Hello world".into()
+                    ),
+                }
+            ]
         );
         // Dropping a buffer causes it to be closed on the LSP side as well.
         cx.update(|_| drop(buffer_2));
@@ -1577,6 +1769,7 @@ mod tests {
         fn disk_state(&self) -> language::DiskState {
             language::DiskState::Present {
                 mtime: ::fs::MTime::from_seconds_and_nanos(100, 42),
+                size: 0,
             }
         }
 
@@ -1622,10 +1815,73 @@ mod tests {
             unimplemented!()
         }
     }
-}
 
-#[cfg(test)]
-#[ctor::ctor]
-fn init_logger() {
-    zlog::init_test();
+    #[gpui::test]
+    async fn test_copilot_starts_when_ai_becomes_enabled(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            DisableAiSettings::register(cx);
+            AllLanguageSettings::register(cx);
+
+            // AI is initially disabled
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+        });
+
+        let copilot = cx.new(|cx| Copilot {
+            server_id: LanguageServerId(0),
+            fs: FakeFs::new(cx.background_executor().clone()),
+            node_runtime: NodeRuntime::unavailable(),
+            server: CopilotServer::Disabled,
+            buffers: Default::default(),
+            _subscriptions: vec![],
+        });
+
+        // Verify copilot is disabled initially
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Disabled),
+                "Copilot should be disabled initially"
+            );
+        });
+
+        // Try to start - should fail because AI is disabled
+        // Use check_edit_prediction_provider=false to skip provider check
+        copilot.update(cx, |copilot, cx| {
+            copilot.start_copilot(false, false, cx);
+        });
+
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Disabled),
+                "Copilot should remain disabled when disable_ai is true"
+            );
+        });
+
+        // Now enable AI
+        cx.update(|cx| {
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: false }, cx);
+        });
+
+        // Try to start again - should work now
+        copilot.update(cx, |copilot, cx| {
+            copilot.start_copilot(false, false, cx);
+        });
+
+        copilot.read_with(cx, |copilot, _| {
+            assert!(
+                matches!(copilot.server, CopilotServer::Starting { .. }),
+                "Copilot should be starting after disable_ai is set to false"
+            );
+        });
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
 }
