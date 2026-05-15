@@ -1261,7 +1261,7 @@ impl GitPanel {
                     ProjectDiff::deploy_single_file(workspace, entry.clone(), window, cx);
                 })
                 .ok();
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
 
             Some(())
         });
