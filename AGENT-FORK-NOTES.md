@@ -1,28 +1,31 @@
-# Agent notes — Zed fork with single-file diff feature
+# Agent notes — Zed fork with single-file diff default
 
 Quick-reference for any AI agent helping with this fork. Read this once and you have full context.
 
 ## What this repo is
 
-A personal fork of [zed-industries/zed](https://github.com/zed-industries/zed) with **one custom feature**: clicking a file in the git panel opens a diff filtered to just that file (instead of the multi-file scrollable diff). Setting name: `single_file_diff_on_click`, defaults to `true`.
+A personal fork of [zed-industries/zed](https://github.com/zed-industries/zed). The original custom feature (click a file in the git panel → open only that file's diff) is now **upstream**. Official Zed added `git_panel.entry_primary_click_action` (`project_diff` | `file_diff` | `view_file`) and `SoloDiffView`.
+
+This fork's only remaining customization is the **default**: `file_diff` instead of upstream's `project_diff`.
 
 Remotes:
 - `origin` → `https://github.com/brijesh-vadi/zed.git` (the fork, push target)
 - `upstream` → `https://github.com/zed-industries/zed.git` (official Zed, pull-only)
 
-## Where the custom feature lives
+## Where the fork default lives
 
-Touch these files carefully during merges — preserve all four.
+Do **not** re-port the old `single_file_diff_on_click` / `deploy_single_file` / `single_file_filter` patch. That code is obsolete. Upstream's `GitPanelClickBehavior::FileDiff` opens `SoloDiffView`.
+
+Preserve these default changes during merges:
 
 | File | What's in it |
 |---|---|
-| `crates/settings_content/src/settings_content.rs` | `pub single_file_diff_on_click: Option<bool>` field on `GitPanelSettingsContent` |
-| `crates/git_ui/src/git_panel_settings.rs` | `pub single_file_diff_on_click: bool` field + merge logic |
-| `crates/git_ui/src/git_panel.rs` | `fn open_single_file_diff(...)` + click handler that branches on the setting |
-| `crates/git_ui/src/project_diff.rs` | `single_file_filter: Option<GitStatusEntry>` field, `pub fn deploy_single_file(...)`, and the `retain` filter inside `refresh()` |
-| `assets/settings/default.json` | `"single_file_diff_on_click": true` under `"git_panel"` |
+| `assets/settings/default.json` | `"entry_primary_click_action": "file_diff"` under `"git_panel"` |
+| `crates/settings_content/src/settings_content.rs` | `#[default]` on `GitPanelClickBehavior::FileDiff` (upstream defaults `ProjectDiff`) |
 
-Note: `crates/settings/src/settings_content.rs` (path in the older `FORK-SYNC-GUIDE.md`) is **wrong** — upstream renamed the crate to `settings_content`. Use the path above.
+Secondary/cmd-click still swaps to the project-wide diff. Double-click / explicit view-file actions still open the file.
+
+If a user's `settings.json` still has the old `"single_file_diff_on_click": true`, it is ignored. They can delete it; the fork default already does the same thing.
 
 ## Build (Apple Silicon, DMG on Desktop)
 
@@ -66,43 +69,35 @@ There's also `sync-with-upstream.sh` for the automated version, but doing it man
 
 ### Conflict resolution playbook
 
-Conflicts almost always land in `git_panel.rs`, `project_diff.rs`, `git_panel_settings.rs`, and sometimes `Cargo.toml`. Rules:
+Conflicts may land in `git_panel.rs`, `project_diff.rs`, `git_panel_settings.rs`, `settings_content.rs`, `default.json`, and `Cargo.toml`. Rules:
 
-1. **Always preserve the four feature files' custom code.** If upstream renamed a symbol/variable/function around our code, adapt — don't drop our logic.
-2. **Drop stale custom helpers that upstream has obsoleted.** Example: an earlier merge had a `file_history()` function referencing `FileHistoryView::open`. Upstream PR #50288 replaced `FileHistoryView` with a git graph view — keeping `file_history()` would fail to compile. Remove it during the merge.
-3. **For the click handler in `git_panel.rs`**: upstream added `event.click_count() > 1` for double-click-to-open-file (PR #47989). The merged condition should combine both behaviors:
-   ```rust
-   if event.click_count() > 1 || event.modifiers().secondary() {
-       this.open_file(...)
-   } else if event.modifiers().platform || event.modifiers().control {
-       this.open_file(...)
-   } else {
-       let settings = GitPanelSettings::get_global(cx);
-       if settings.single_file_diff_on_click {
-           this.open_single_file_diff(...)
-       } else {
-           this.open_diff(...)
-       }
-   }
-   ```
-4. **For `Cargo.toml` bundle metadata conflicts**: upstream renamed `[package.metadata.bundle]` → `[package.metadata.bundle-dev]` for consistency. Take upstream's name.
-5. **Validate before committing the merge**: `cargo check --package git_ui --target aarch64-apple-darwin` is the quickest signal that the resolution compiles. If it passes, the build will too. ~7 min cold, much faster warm.
+1. **Take upstream for `git_panel.rs` / `project_diff.rs`.** Do not re-apply `open_single_file_diff`, `deploy_single_file`, or `single_file_filter`. Official `open_solo_diff` / `SoloDiffView` replaced that.
+2. **Re-apply only the default.** After the merge, `git_panel.entry_primary_click_action` must be `"file_diff"` in `assets/settings/default.json`, and `GitPanelClickBehavior::FileDiff` must keep `#[default]`.
+3. **Drop leftover `single_file_diff_on_click` fields** if a merge re-introduces them. They will panic on `.unwrap()` if the key is missing from default.json.
+4. **For `Cargo.toml` bundle metadata conflicts**: take upstream (`[package.metadata.bundle-dev]`).
+5. **Validate before committing the merge**: `cargo check --package git_ui --target aarch64-apple-darwin` is the quickest signal that the resolution compiles. If it passes, the build will too.
 
 ### Post-merge verification
 
-After the build finishes, confirm the feature is in the binary:
+After the build finishes, confirm the official single-file view is in the binary:
 
 ```sh
-nm /Users/brijesh/Desktop/Zed.app/Contents/MacOS/zed | grep deploy_single_file
+nm /Users/brijesh/Desktop/Zed.app/Contents/MacOS/zed | grep -i SoloDiff
 ```
 
-Should print at least one symbol mentioning `ProjectDiff::deploy_single_file`. If empty, the merge dropped your code.
+Should print symbols mentioning `SoloDiffView`. Also confirm defaults:
+
+```sh
+grep -n entry_primary_click_action assets/settings/default.json
+```
+
+Must be `"file_diff"`.
 
 Smoke test the running app:
-- Click a file in git panel → only that file's diff shown, tab reads `Diff: <filename>`
-- Double-click → opens the actual file
-- Cmd-click → opens the actual file
-- `ProjectDiff::deploy_at` (regular "Project Diff" action) → all files
+- Click a file in git panel → only that file's diff (`SoloDiffView`)
+- Cmd-click / secondary click → project-wide diff
+- `entry_primary_click_action` of `project_diff` still available in settings
+- Regular "Project Diff" action → all files
 
 ## Common gotchas
 
