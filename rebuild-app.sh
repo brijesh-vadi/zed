@@ -81,9 +81,9 @@ cat > /Users/brijesh/Desktop/Zed.app/Contents/Info.plist << 'EOF'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.20.0</string>
+	<string>1.32.0</string>
 	<key>CFBundleVersion</key>
-	<string>1020000</string>
+	<string>1032000</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>10.15.7</string>
 	<key>NSHighResolutionCapable</key>

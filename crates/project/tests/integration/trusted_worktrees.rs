@@ -33,6 +33,485 @@ fn init_trust_global(
     })
 }
 
+#[cfg(windows)]
+#[gpui::test]
+async fn test_differently_cased_db_trusted_parent_path(cx: &mut TestAppContext) {
+    use fs::RealFs;
+    use std::path::Path;
+    use util::{paths::SanitizedPath, test::TempTree};
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({ "Dev": { "one": {}, "two": {} } }));
+    let root = SanitizedPath::new(dir.path()).as_path().to_path_buf();
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(None, HashSet::from_iter([root.join("DEV")]))]),
+            cx,
+        )
+    });
+    let one = root.join("Dev").join("one");
+    let two = root.join("Dev").join("two");
+    let untracked_project =
+        Project::test(RealFs::new(None, cx.executor()), [one.as_path()], cx).await;
+    // Both tracked stores are registered before either opens a child of the trusted parent.
+    let no_paths: [&Path; 0] = [];
+    let project_a =
+        Project::test_with_worktree_trust(RealFs::new(None, cx.executor()), no_paths, cx).await;
+    let project_b =
+        Project::test_with_worktree_trust(RealFs::new(None, cx.executor()), no_paths, cx).await;
+    for (project, path) in [(&project_a, &one), (&project_b, &two)] {
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path, true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    for (project, trusted) in [
+        (project_a, true),
+        (project_b, true),
+        (untracked_project, false),
+    ] {
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let worktree_id = worktree_store.read_with(cx, |store, cx| {
+            store.worktrees().next().unwrap().read(cx).id()
+        });
+        trusted_worktrees.update(cx, |store, cx| {
+            assert_eq!(
+                store.can_trust(&worktree_store, worktree_id, cx),
+                trusted,
+                "a differently cased trusted parent should trust its subdirectories \
+                 in every worktree store tracked for trust, and only there"
+            );
+        });
+    }
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_differently_cased_db_trusted_path_on_mapped_drive(cx: &mut TestAppContext) {
+    use fs::{Fs as _, RealFs};
+    use std::path::Path;
+    use util::{ResultExt as _, paths::SanitizedPath, test::TempTree};
+
+    /// A free drive letter mapped to the directory's administrative network share.
+    struct MappedDrive(PathBuf);
+
+    impl MappedDrive {
+        #[allow(clippy::disallowed_methods)]
+        fn new(target: &Path) -> Option<Self> {
+            let share = format!(
+                r"\\localhost\{}",
+                target.to_string_lossy().replacen(':', "$", 1)
+            );
+            if !Path::new(&share).exists() {
+                return None;
+            }
+            ('M'..='Z').rev().find_map(|letter| {
+                let root = PathBuf::from(format!("{letter}:\\"));
+                if root.exists() {
+                    return None;
+                }
+                std::process::Command::new("net")
+                    .args(["use", &format!("{letter}:"), &share, "/persistent:no"])
+                    .output()
+                    .ok()?
+                    .status
+                    .success()
+                    .then(|| Self(root))
+            })
+        }
+    }
+
+    impl Drop for MappedDrive {
+        #[allow(clippy::disallowed_methods)]
+        fn drop(&mut self) {
+            let drive = self.0.to_string_lossy();
+            std::process::Command::new("net")
+                .args(["use", drive.trim_end_matches('\\'), "/delete", "/y"])
+                .output()
+                .log_err();
+        }
+    }
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({ "Project": {} }));
+    let Some(drive) = MappedDrive::new(SanitizedPath::new(dir.path()).as_path()) else {
+        eprintln!("skipping: no drive letter could be mapped to a network share");
+        return;
+    };
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(None, HashSet::from_iter([drive.0.join("project")]))]),
+            cx,
+        )
+    });
+    let fs = RealFs::new(None, cx.executor());
+    // Zed opens a worktree by its canonical path, which keeps the mapped drive letter.
+    let worktree_path = fs.canonicalize(&drive.0.join("project")).await.unwrap();
+    assert_eq!(worktree_path, drive.0.join("Project"));
+    let project = Project::test_with_worktree_trust(fs, [worktree_path.as_path()], cx).await;
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_id = worktree_store.read_with(cx, |store, cx| {
+        store.worktrees().next().unwrap().read(cx).id()
+    });
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        assert!(
+            store.can_trust(&worktree_store, worktree_id, cx),
+            "a differently cased trusted path on a mapped drive should match its directory"
+        );
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_differently_cased_db_trusted_path_longer_than_max_path(cx: &mut TestAppContext) {
+    use fs::{Fs as _, RealFs};
+    use util::{paths::SanitizedPath, test::TempTree};
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({}));
+    let root = dir.path().join("review");
+    // A long project trusted itself, and one trusted through its shorter parent: both get saved
+    // in the extended-length `\\?\C:\` form that the project path keeps.
+    let deep_parent = ["a", "b", "c"]
+        .iter()
+        .fold(root.join("deep"), |path, letter| {
+            path.join(letter.repeat(90))
+        });
+    let short_parent = root.join("Dev");
+    let fs = RealFs::new(None, cx.executor());
+    for path in [
+        deep_parent.join("Project"),
+        short_parent.join("x".repeat(240)),
+    ] {
+        fs.create_dir(&path).await.unwrap();
+    }
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(
+                None,
+                HashSet::from_iter([deep_parent.join("project"), root.join("dev")]),
+            )]),
+            cx,
+        )
+    });
+    let mut worktree_paths = Vec::new();
+    for path in [
+        deep_parent.join("project"),
+        root.join("dev").join("x".repeat(240)),
+    ] {
+        let worktree_path = fs.canonicalize(&path).await.unwrap();
+        assert!(
+            worktree_path.as_os_str().len() > 260
+                && SanitizedPath::new(&worktree_path).as_path() == worktree_path
+                && worktree_path.to_string_lossy().starts_with(r"\\?\"),
+            "worktree paths longer than `MAX_PATH` should keep their `\\\\?\\` form"
+        );
+        worktree_paths.push(worktree_path);
+    }
+    assert_eq!(worktree_paths[0], deep_parent.join("Project"));
+    let project =
+        Project::test_with_worktree_trust(fs, worktree_paths.iter().map(|path| path.as_path()), cx)
+            .await;
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_ids = worktree_store.read_with(cx, |store, cx| {
+        store
+            .worktrees()
+            .map(|worktree| worktree.read(cx).id())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(worktree_ids.len(), 2);
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        for worktree_id in worktree_ids {
+            assert!(
+                store.can_trust(&worktree_store, worktree_id, cx),
+                "a differently cased trusted path should match its directory longer than `MAX_PATH`"
+            );
+        }
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_differently_cased_db_trusted_path_under_unlistable_parent(cx: &mut TestAppContext) {
+    use fs::RealFs;
+    use std::path::Path;
+    use util::{paths::SanitizedPath, test::TempTree};
+
+    /// Denies listing a directory's contents while still allowing to traverse it.
+    struct UnlistableDirectory(PathBuf, String);
+
+    impl UnlistableDirectory {
+        #[allow(clippy::disallowed_methods)]
+        fn new(path: &Path) -> Option<Self> {
+            let user = format!(
+                "{}\\{}",
+                std::env::var("USERDOMAIN").ok()?,
+                std::env::var("USERNAME").ok()?
+            );
+            let denied = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/deny", &format!("{user}:(RD)")])
+                .output()
+                .ok()?
+                .status
+                .success();
+            let unlistable = denied.then(|| Self(path.to_path_buf(), user))?;
+            // Elevated or privileged accounts may still list the directory.
+            std::fs::read_dir(path).is_err().then_some(unlistable)
+        }
+    }
+
+    impl Drop for UnlistableDirectory {
+        #[allow(clippy::disallowed_methods)]
+        fn drop(&mut self) {
+            let restored = std::process::Command::new("icacls")
+                .arg(&self.0)
+                .args(["/remove:d", &self.1])
+                .output();
+            if !restored
+                .as_ref()
+                .is_ok_and(|output| output.status.success())
+            {
+                eprintln!("failed to restore listing {:?}: {restored:?}", self.0);
+            }
+        }
+    }
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({ "Private": { "Project": {} } }));
+    let root = SanitizedPath::new(dir.path()).as_path().to_path_buf();
+    let Some(_unlistable) = UnlistableDirectory::new(&root.join("Private")) else {
+        eprintln!("skipping: directory listing could not be denied");
+        return;
+    };
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(
+                None,
+                HashSet::from_iter([root.join("Private").join("project")]),
+            )]),
+            cx,
+        )
+    });
+    let project = Project::test_with_worktree_trust(
+        RealFs::new(None, cx.executor()),
+        [root.join("Private").join("Project").as_path()],
+        cx,
+    )
+    .await;
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_id = worktree_store.read_with(cx, |store, cx| {
+        store.worktrees().next().unwrap().read(cx).id()
+    });
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        assert!(
+            store.can_trust(&worktree_store, worktree_id, cx),
+            "a differently cased trusted path should match its directory \
+             even when a parent directory cannot be listed"
+        );
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_db_trusted_paths_on_case_sensitive_fake_fs(cx: &mut TestAppContext) {
+    use std::path::Path;
+
+    init_test(cx);
+
+    // A case-sensitive file system, where distinct directories and link targets may have names
+    // differing only by case.
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "safe": {}, "SAFE": {}, "only": {}, "LINK": {}, "PARENT": { "project": {} } }),
+    )
+    .await;
+    fs.insert_symlink(path!("/root/link"), PathBuf::from(path!("/root/LINK")))
+        .await;
+    fs.insert_symlink(path!("/root/parent"), PathBuf::from(path!("/root/PARENT")))
+        .await;
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(
+                None,
+                HashSet::from_iter([
+                    PathBuf::from(path!("/root/safe")),
+                    PathBuf::from(path!("/root/ONLY")),
+                    PathBuf::from(path!("/root/link")),
+                    PathBuf::from(path!("/root/parent/project")),
+                ]),
+            )]),
+            cx,
+        )
+    });
+    let expected_trust = [
+        (path!("/root/safe"), true, "`safe` is trusted"),
+        (
+            path!("/root/SAFE"),
+            false,
+            "trusting `safe` must not trust the distinct `SAFE` directory",
+        ),
+        (
+            path!("/root/only"),
+            false,
+            "`ONLY` names no directory on a case-sensitive file system",
+        ),
+        (
+            path!("/root/LINK"),
+            false,
+            "a trusted link must not extend trust to its target",
+        ),
+        (
+            path!("/root/PARENT/project"),
+            false,
+            "a link in a parent directory must not extend trust to its target",
+        ),
+    ];
+    let project = Project::test_with_worktree_trust(
+        fs,
+        expected_trust.iter().map(|(path, _, _)| Path::new(path)),
+        cx,
+    )
+    .await;
+
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_ids = worktree_store.read_with(cx, |store, cx| {
+        store
+            .worktrees()
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.abs_path().to_path_buf(), worktree.id())
+            })
+            .collect::<collections::HashMap<_, _>>()
+    });
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        for (path, trusted, message) in expected_trust {
+            let worktree_id = worktree_ids[Path::new(path)];
+            assert_eq!(
+                store.can_trust(&worktree_store, worktree_id, cx),
+                trusted,
+                "{message}"
+            );
+        }
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_db_trusted_path_in_case_sensitive_directory(cx: &mut TestAppContext) {
+    use fs::{Fs as _, RealFs};
+    use util::{command::new_command, paths::SanitizedPath, test::TempTree};
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({ "case-test": {} }));
+    let root = SanitizedPath::new(dir.path()).as_path().join("case-test");
+    let enabled = new_command("fsutil")
+        .args(["file", "setCaseSensitiveInfo"])
+        .arg(&root)
+        .arg("enable")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !enabled {
+        eprintln!("skipping: per-directory case sensitivity is not available");
+        return;
+    }
+    let fs = RealFs::new(None, cx.executor());
+    for name in ["safe", "SAFE", "only", "LINK", "PARENT\\project"] {
+        fs.create_dir(&root.join(name)).await.unwrap();
+    }
+    // Junctions whose targets differ from their own names only by case.
+    for (link, target) in [("link", "LINK"), ("parent", "PARENT")] {
+        fs.create_symlink(&root.join(link), root.join(target))
+            .await
+            .unwrap();
+    }
+
+    cx.update(|cx| {
+        init(
+            DbTrustedPaths::from_iter([(
+                None,
+                HashSet::from_iter([
+                    root.join("safe"),
+                    root.join("ONLY"),
+                    root.join("link"),
+                    root.join("parent").join("project"),
+                ]),
+            )]),
+            cx,
+        )
+    });
+    let project = Project::test_with_worktree_trust(
+        fs,
+        [
+            root.join("safe").as_path(),
+            root.join("SAFE").as_path(),
+            root.join("only").as_path(),
+            root.join("LINK").as_path(),
+            root.join("PARENT").join("project").as_path(),
+        ],
+        cx,
+    )
+    .await;
+    cx.run_until_parked();
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_ids = worktree_store.read_with(cx, |store, cx| {
+        store
+            .worktrees()
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.abs_path().to_path_buf(), worktree.id())
+            })
+            .collect::<collections::HashMap<_, _>>()
+    });
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        let mut can_trust =
+            |name: &str| store.can_trust(&worktree_store, worktree_ids[&root.join(name)], cx);
+        assert!(can_trust("safe"));
+        assert!(
+            !can_trust("SAFE"),
+            "trusting `safe` must not trust the distinct `SAFE` directory"
+        );
+        assert!(
+            !can_trust("only"),
+            "`ONLY` names no directory in a case-sensitive directory"
+        );
+        assert!(
+            !can_trust("LINK"),
+            "a trusted junction must not extend trust to its target"
+        );
+        assert!(
+            !can_trust("PARENT\\project"),
+            "a junction in a parent directory must not extend trust to its target"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_single_worktree_trust(cx: &mut TestAppContext) {
     init_test(cx);
@@ -953,5 +1432,123 @@ async fn test_invisible_worktree_stores_do_not_affect_trust(cx: &mut TestAppCont
             store.restricted_worktrees_for_store(&worktree_store)
         }),
         "only visible worktrees should be restricted"
+    );
+}
+
+#[gpui::test]
+async fn test_windows_style_abs_path_trust_from_unix_client(cx: &mut TestAppContext) {
+    use gpui::AppContext as _;
+    use project::worktree_store::WorktreeIdCounter;
+    use rpc::{AnyProtoClient, NoopProtoClient, proto};
+    use util::paths::PathStyle;
+    use worktree::Worktree;
+
+    init_test(cx);
+
+    let client = AnyProtoClient::new(NoopProtoClient::new());
+    let worktree_store = cx.update(|cx| {
+        cx.new(|_| {
+            WorktreeStore::remote(
+                true,
+                client.clone(),
+                1,
+                PathStyle::Windows,
+                WorktreeIdCounter::default(),
+            )
+        })
+    });
+
+    let make_worktree = |id: u64, name: &str, abs_path: &str, cx: &mut TestAppContext| {
+        let metadata = proto::WorktreeMetadata {
+            id,
+            root_name: name.to_string(),
+            visible: true,
+            abs_path: abs_path.to_string(),
+            root_repo_common_dir: None,
+            root_repo_is_linked_worktree: false,
+        };
+        let worktree = cx.update(|cx| {
+            Worktree::remote(
+                1,
+                clock::ReplicaId::new(1),
+                metadata,
+                client.clone(),
+                PathStyle::Windows,
+                cx,
+            )
+        });
+        worktree.update(cx, |worktree, _| {
+            worktree
+                .as_remote()
+                .unwrap()
+                .update_from_remote(proto::UpdateWorktree {
+                    project_id: 1,
+                    worktree_id: id,
+                    abs_path: abs_path.to_string(),
+                    root_name: name.to_string(),
+                    updated_entries: vec![proto::Entry {
+                        id: 1,
+                        is_dir: true,
+                        path: "".to_string(),
+                        inode: 1,
+                        mtime: Some(proto::Timestamp {
+                            seconds: 0,
+                            nanos: 0,
+                        }),
+                        is_ignored: false,
+                        is_hidden: false,
+                        is_external: false,
+                        is_fifo: false,
+                        size: None,
+                        canonical_path: None,
+                        is_unloaded: false,
+                    }],
+                    removed_entries: vec![],
+                    scan_id: 1,
+                    is_last_update: true,
+                    updated_repositories: vec![],
+                    removed_repositories: vec![],
+                    root_repo_common_dir: None,
+                    root_repo_is_linked_worktree: false,
+                });
+        });
+        cx.run_until_parked();
+        worktree
+    };
+
+    let worktree_t1 = make_worktree(1, "t1", r"C:\Users\me\dev\wt\t1", cx);
+    let worktree_t2 = make_worktree(2, "t2", r"C:\Users\me\dev\wt\t2", cx);
+    let t1_id = worktree_t1.read_with(cx, |worktree, _| worktree.id());
+    let t2_id = worktree_t2.read_with(cx, |worktree, _| worktree.id());
+    worktree_store.update(cx, |store, cx| {
+        store.add(&worktree_t1, cx);
+        store.add(&worktree_t2, cx);
+    });
+    assert!(
+        !worktree_t1.read_with(cx, |worktree, _| worktree.is_single_file()),
+        "t1 must be a folder worktree for this test to be meaningful"
+    );
+
+    let trusted_worktrees = init_trust_global(worktree_store.clone(), cx);
+
+    assert!(
+        !trusted_worktrees.update(cx, |store, cx| store.can_trust(&worktree_store, t1_id, cx)),
+        "t1 should be restricted by default"
+    );
+
+    trusted_worktrees.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([
+                PathTrust::Worktree(t1_id),
+                PathTrust::AbsPath(PathBuf::from(r"C:\Users\me\dev\wt")),
+            ]),
+            cx,
+        );
+    });
+
+    assert!(
+        trusted_worktrees.update(cx, |store, cx| store.can_trust(&worktree_store, t2_id, cx)),
+        "t2 should be auto-trusted by the trusted parent scope C:\\Users\\me\\dev\\wt"
     );
 }

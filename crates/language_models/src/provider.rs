@@ -13,6 +13,7 @@ pub mod google;
 pub mod llama_cpp;
 pub mod lmstudio;
 pub mod mistral;
+mod model_catalog_cache;
 pub mod ollama;
 pub mod open_ai;
 pub mod open_ai_compatible;
@@ -22,6 +23,7 @@ pub mod opencode;
 
 pub mod vercel_ai_gateway;
 pub mod x_ai;
+pub mod x_ai_subscribed;
 
 const COMMON_RESERVED_HEADER_NAMES: &[&str] = &["Authorization", "Content-Type", "Accept"];
 

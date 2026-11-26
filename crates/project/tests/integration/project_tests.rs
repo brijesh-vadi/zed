@@ -25,8 +25,7 @@ use buffer_diff::{
     BufferDiff, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkStatusKind, assert_hunks,
 };
 use collections::{BTreeSet, HashMap, HashSet};
-use encoding_rs;
-use fs::{FakeFs, PathEventKind, RealFs};
+use fs::{FakeFs, PathEventKind, RealFs, RenameOptions};
 use futures::{FutureExt as _, StreamExt, channel::oneshot, future};
 use git::{
     GitHostingProviderRegistry,
@@ -41,9 +40,9 @@ use itertools::Itertools;
 use language::{
     Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticEntryRef, DiagnosticMessage,
     DiagnosticSet, DiagnosticSourceKind, DiskState, FakeLspAdapter, Language, LanguageAwareStyling,
-    LanguageConfig, LanguageMatcher, LanguageName, LineEnding, ManifestName, ManifestProvider,
-    ManifestQuery, OffsetRangeExt, Point, ToPoint, Toolchain, ToolchainList, ToolchainLister,
-    ToolchainMetadata,
+    LanguageConfig, LanguageConfigOverride, LanguageMatcher, LanguageName, LineEnding,
+    ManifestName, ManifestProvider, ManifestQuery, OffsetRangeExt, Override, Point, ToPoint,
+    Toolchain, ToolchainList, ToolchainLister, ToolchainMetadata,
     language_settings::{
         Formatter, FormatterList, LanguageSettings, LanguageSettingsContent, LineEndingSetting,
     },
@@ -85,6 +84,8 @@ use std::{
     task::Poll,
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
 use sum_tree::SumTree;
 use task::{ResolvedTask, ShellKind, TaskContext};
 use text::{Anchor, PointUtf16, ReplicaId, ToOffset, Unclipped};
@@ -221,7 +222,7 @@ async fn test_symlinks(cx: &mut gpui::TestAppContext) {
     .unwrap();
 
     let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
+        RealFs::new(None, cx.executor()),
         [root_link_path.as_ref()],
         cx,
     )
@@ -236,6 +237,153 @@ async fn test_symlinks(cx: &mut gpui::TestAppContext) {
                 .unwrap()
                 .inode
         );
+    });
+}
+
+#[cfg(not(windows))]
+#[gpui::test]
+async fn test_resolve_abs_file_link_project_aliases(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions =
+                    Some(SplicingVec::from(vec!["**/hidden".to_string()]));
+            });
+        });
+    });
+
+    let directory = TempTree::new(json!({
+        "project": {
+            "sub": {},
+            "hidden": {"unopened.rs": "unindexed"},
+        },
+        "outside": {
+            "child": {},
+            "target.rs": "saved",
+            "link.rs": "actual outside target",
+        },
+    }));
+    let root = directory.path().join("project");
+    let target = directory.path().join("outside/target.rs");
+    os::unix::fs::symlink(&target, root.join("link.rs")).unwrap();
+    os::unix::fs::symlink(root.join("sub"), root.join("hop")).unwrap();
+    os::unix::fs::symlink(directory.path().join("outside/child"), root.join("escape")).unwrap();
+    let outside_alias = directory.path().join("outside/alias.rs");
+    os::unix::fs::symlink(&target, &outside_alias).unwrap();
+
+    let project = Project::test(RealFs::new(None, cx.executor()), [root.as_path()], cx).await;
+    let alias = project.read_with(cx, |project, cx| {
+        project
+            .project_path_for_absolute_path(&root.join("link.rs"), cx)
+            .unwrap()
+    });
+    let buffer = project
+        .update(cx, |project, cx| project.open_buffer(alias.clone(), cx))
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved ")], None, cx);
+    });
+
+    for relative_path in ["hop/../link.rs", "hidden/../link.rs"] {
+        let path = root.join(relative_path);
+        let resolved = project
+            .update(cx, |project, cx| {
+                project.resolve_abs_file_link(path.to_str().unwrap(), cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.project_path(), Some(&alias), "{relative_path}");
+        let reopened = project
+            .update(cx, |project, cx| {
+                project.open_buffer(resolved.project_path().unwrap().clone(), cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reopened, buffer);
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "unsaved saved");
+            assert!(buffer.is_dirty());
+        });
+    }
+
+    let unindexed_path = root.join("hidden/unopened.rs");
+    let unindexed_alias = project.read_with(cx, |project, cx| {
+        let path = project
+            .project_path_for_absolute_path(&unindexed_path, cx)
+            .unwrap();
+        assert!(project.entry_for_path(&path, cx).is_none());
+        assert!(project.get_open_buffer(&path, cx).is_none());
+        assert!(
+            project
+                .entry_for_path(&(alias.worktree_id, rel_path("hidden")).into(), cx)
+                .is_none()
+        );
+        path
+    });
+    let resolved = project
+        .update(cx, |project, cx| {
+            project.resolve_abs_file_link(unindexed_path.to_str().unwrap(), cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.project_path(), Some(&unindexed_alias));
+
+    for (input, expected) in [
+        (
+            root.join("escape/../link.rs"),
+            directory.path().join("outside/link.rs"),
+        ),
+        (outside_alias, target),
+    ] {
+        let resolved = project
+            .update(cx, |project, cx| {
+                project.resolve_abs_file_link(input.to_str().unwrap(), cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.abs_path(), expected.to_str());
+    }
+    let missing = root.join("missing/../link.rs");
+    let resolved = project
+        .update(cx, |project, cx| {
+            project.resolve_abs_file_link(missing.to_str().unwrap(), cx)
+        })
+        .await
+        .unwrap();
+    assert!(resolved.is_none());
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.worktrees(cx).count(), 1);
+        assert_eq!(project.get_open_buffer(&alias, cx), Some(buffer));
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+async fn test_resolve_abs_file_link_rejects_non_utf8_target(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let directory = TempTree::new(json!({}));
+    let target = directory.path().join(OsStr::from_bytes(b"\xff.rs"));
+    std::fs::write(&target, "actual target").unwrap();
+    std::fs::write(directory.path().join("�.rs"), "replacement-character decoy").unwrap();
+    let alias = directory.path().join("alias.rs");
+    os::unix::fs::symlink(&target, &alias).unwrap();
+    let project = Project::test(RealFs::new(None, cx.executor()), [], cx).await;
+    let error = project
+        .update(cx, |project, cx| {
+            project.resolve_abs_file_link(alias.to_str().unwrap(), cx)
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "canonical file path is not valid UTF-8");
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.worktrees(cx).count(), 0);
     });
 }
 
@@ -1205,6 +1353,175 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_project_tasks_and_debug_scenarios_require_trust(cx: &mut gpui::TestAppContext) {
+    use project::trusted_worktrees::{self, DbTrustedPaths, PathTrust, TrustedWorktrees};
+
+    init_test(cx);
+    TaskStore::init(None);
+    cx.update(|cx| trusted_worktrees::init(DbTrustedPaths::default(), cx));
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            ".zed": {
+                "settings.json": r#"{ "tab_size": 8 }"#,
+                "tasks.json": r#"[{ "label": "initial", "command": "echo initial", "hooks": ["create_worktree"] }]"#,
+                "debug.json": r#"[{ "label": "debug", "adapter": "Debugpy", "request": "launch" }]"#,
+            },
+            "file.rs": ""
+        }),
+    )
+    .await;
+
+    let project = Project::test_with_worktree_trust(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    cx.run_until_parked();
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_id = worktree_store.read_with(cx, |store, cx| {
+        store.worktrees().next().unwrap().read(cx).id()
+    });
+    let inventory = project.read_with(cx, |project, cx| {
+        project
+            .task_store()
+            .read(cx)
+            .task_inventory()
+            .unwrap()
+            .clone()
+    });
+    let contexts = TaskContexts {
+        active_worktree_context: Some((worktree_id, TaskContext::default())),
+        ..Default::default()
+    };
+    let hooks = HashSet::from_iter([task::TaskHook::CreateWorktree]);
+
+    assert!(inventory.read_with(cx, |inventory, _| {
+        inventory
+            .templates_with_hooks(&hooks, worktree_id)
+            .is_empty()
+    }));
+    let (_, scenarios) = inventory
+        .update(cx, |inventory, cx| {
+            inventory.list_debug_scenarios(&contexts, Vec::new(), Vec::new(), false, cx)
+        })
+        .await;
+    assert!(scenarios.is_empty());
+
+    fs.save(
+        path!("/dir/.zed/tasks.json").as_ref(),
+        &r#"[{ "label": "updated", "command": "echo updated", "hooks": ["create_worktree"] }]"#
+            .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    assert!(inventory.read_with(cx, |inventory, _| {
+        inventory
+            .templates_with_hooks(&hooks, worktree_id)
+            .is_empty()
+    }));
+
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted_worktrees.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let templates = inventory.read_with(cx, |inventory, _| {
+        inventory.templates_with_hooks(&hooks, worktree_id)
+    });
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].1.label, "updated");
+    assert_eq!(templates[0].1.command, "echo updated");
+    let (_, scenarios) = inventory
+        .update(cx, |inventory, cx| {
+            inventory.list_debug_scenarios(&contexts, Vec::new(), Vec::new(), false, cx)
+        })
+        .await;
+    assert_eq!(scenarios.len(), 1);
+    assert_eq!(scenarios[0].1.label, "debug");
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_debug_scenarios_load_with_differently_cased_db_trusted_path(
+    cx: &mut gpui::TestAppContext,
+) {
+    use project::trusted_worktrees::{self, DbTrustedPaths, TrustedWorktrees};
+
+    init_test(cx);
+    TaskStore::init(None);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.set_case_sensitive(false);
+    fs.insert_tree(
+        path!("/root/Project"),
+        json!({
+            ".zed": {
+                "debug.json": r#"[{ "label": "debug", "adapter": "Debugpy", "request": "launch" }]"#,
+            },
+        }),
+    )
+    .await;
+    let root = PathBuf::from(path!("/root"));
+    let db_trusted_paths =
+        DbTrustedPaths::from_iter([(None, HashSet::from_iter([root.join("project")]))]);
+    cx.update(|cx| trusted_worktrees::init(db_trusted_paths, cx));
+    let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+
+    let no_paths: [&Path; 0] = [];
+    let project = Project::test_with_worktree_trust(fs, no_paths, cx).await;
+    let release_casing_resolution =
+        trusted_worktrees.update(cx, |store, _| store.hold_next_casing_resolution());
+    let create_worktree = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(root.join("Project"), true, cx)
+    });
+    // Let everything else run first: had the worktree started scanning, the scan would finish here.
+    cx.run_until_parked();
+    assert!(
+        project.read_with(cx, |project, cx| project.worktrees(cx).next().is_none()),
+        "the casing resolution should hold the worktree creation"
+    );
+    release_casing_resolution.send(()).unwrap();
+    create_worktree.await.unwrap();
+    cx.run_until_parked();
+
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    assert!(
+        !trusted_worktrees.read_with(cx, |store, cx| store
+            .has_restricted_worktrees(&worktree_store, cx)),
+        "the worktree must never be restricted"
+    );
+
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let inventory = project.read_with(cx, |project, cx| {
+        project
+            .task_store()
+            .read(cx)
+            .task_inventory()
+            .unwrap()
+            .clone()
+    });
+    let contexts = TaskContexts {
+        active_worktree_context: Some((worktree_id, TaskContext::default())),
+        ..Default::default()
+    };
+    let (_, scenarios) = inventory
+        .update(cx, |inventory, cx| {
+            inventory.list_debug_scenarios(&contexts, Vec::new(), Vec::new(), false, cx)
+        })
+        .await;
+    assert_eq!(scenarios.len(), 1);
+    assert_eq!(scenarios[0].1.label, "debug");
+}
+
+#[gpui::test]
 async fn test_invalid_local_tasks_shows_toast_with_doc_link(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     TaskStore::init(None);
@@ -1355,6 +1672,42 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_single_file_worktree_is_not_an_lsp_workspace_folder(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/the-root"),
+        json!({
+            "main.py": "",
+            "pyproject.toml": ""
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/the-root/main.py").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut fake_python_servers = language_registry.register_fake_lsp(
+        "Python",
+        FakeLspAdapter {
+            name: "ty",
+            ..Default::default()
+        },
+    );
+    language_registry.add(python_lang(fs));
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/main.py"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_python_servers.next().await.unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(fake_server.server.workspace_folders(), BTreeSet::new());
+}
+
+#[gpui::test]
 async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -1440,9 +1793,7 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
         "Python",
         FakeLspAdapter {
             name: "ty",
-            capabilities: lsp::ServerCapabilities {
-                ..Default::default()
-            },
+            capabilities: Default::default(),
             ..Default::default()
         },
     );
@@ -1536,7 +1887,7 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
         .await;
 
     assert!(currently_active_toolchain.is_none());
-    let _ = project
+    project
         .update(cx, |this, cx| {
             let worktree_id = this.worktrees(cx).next().unwrap().read(cx).id();
             this.activate_toolchain(
@@ -1573,6 +1924,128 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
 }
 
 #[gpui::test]
+async fn test_save_as_notifies_language_servers_of_the_document_at_its_new_path(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.rs": "" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Options(
+                    lsp::TextDocumentSyncOptions {
+                        save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
+                        ..lsp::TextDocumentSyncOptions::default()
+                    },
+                )),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    let (_running_buffer, _running_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+
+    let notifications = Arc::new(Mutex::new(Vec::new()));
+    let file_name = |uri: &lsp::Uri| {
+        uri.to_file_path()
+            .ok()
+            .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| uri.to_string())
+    };
+    fake_server.handle_notification::<lsp::notification::DidOpenTextDocument, _>({
+        let notifications = notifications.clone();
+        move |params, _| {
+            notifications
+                .lock()
+                .push(format!("open {}", file_name(&params.text_document.uri)))
+        }
+    });
+    fake_server.handle_notification::<lsp::notification::DidSaveTextDocument, _>({
+        let notifications = notifications.clone();
+        move |params, _| {
+            notifications
+                .lock()
+                .push(format!("save {}", file_name(&params.text_document.uri)))
+        }
+    });
+    fake_server.handle_notification::<lsp::notification::DidCloseTextDocument, _>({
+        let notifications = notifications.clone();
+        move |params, _| {
+            notifications
+                .lock()
+                .push(format!("close {}", file_name(&params.text_document.uri)))
+        }
+    });
+
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let save_as = async |buffer: &Entity<Buffer>, path: &str, cx: &mut gpui::TestAppContext| {
+        project
+            .update(cx, |project, cx| {
+                project.save_buffer_as(
+                    buffer.clone(),
+                    ProjectPath {
+                        worktree_id,
+                        path: rel_path(path).into(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        std::mem::take(&mut *notifications.lock())
+    };
+
+    // An untitled buffer only becomes a document of the server by being saved, so the server
+    // must learn about the document before its save.
+    let untitled_buffer = project.update(cx, |project, cx| {
+        project.create_local_buffer("fn main() {}", Some(rust_lang()), true, cx)
+    });
+    let _untitled_handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&untitled_buffer, cx)
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        save_as(&untitled_buffer, "new.rs", cx).await,
+        vec!["open new.rs".to_string(), "save new.rs".to_string()],
+    );
+
+    let (renamed_buffer, _renamed_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    notifications.lock().clear();
+    assert_eq!(
+        save_as(&renamed_buffer, "renamed.rs", cx).await,
+        vec![
+            "close a.rs".to_string(),
+            "open renamed.rs".to_string(),
+            "save renamed.rs".to_string(),
+        ],
+    );
+}
+
+#[gpui::test]
 async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -1582,6 +2055,7 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
         json!({
             "test.rs": "const A: i32 = 1;",
             "test2.rs": "",
+            "later.rs": "fn later() {}",
             "Cargo.toml": "a = 1",
             "package.json": "{\"a\": 1}",
         }),
@@ -1629,6 +2103,26 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
                 ..Default::default()
             },
             ..Default::default()
+        },
+    );
+
+    let (initialize_sender, initialize_receiver) = async_channel::unbounded();
+    let mut replacement_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "replacement-rust-server",
+            opt_in_languages: HashSet::from_iter([LanguageName::new_static("Rust")]),
+            initializer: Some(Box::new(move |server| {
+                let initialize_sender = initialize_sender.clone();
+                server.set_request_handler::<lsp::request::Initialize, _, _>(move |params, _| {
+                    initialize_sender.try_send(params).unwrap();
+                    future::ready(Ok(lsp::InitializeResult {
+                        capabilities: lsp::LanguageServer::full_capabilities(),
+                        server_info: None,
+                    }))
+                });
+            })),
+            ..FakeLspAdapter::default()
         },
     );
 
@@ -1774,19 +2268,20 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
         )
     );
 
-    // Save notifications are reported to all servers.
-    project
-        .update(cx, |project, cx| project.save_buffer(toml_buffer, cx))
-        .await
-        .unwrap();
+    // Static save capabilities only cover the documents a server was opened with, so saving
+    // the TOML buffer notifies no server: the next save notifications are for their own buffers.
+    for buffer in [toml_buffer, rust_buffer2.clone(), json_buffer.clone()] {
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .await
+            .unwrap();
+    }
     assert_eq!(
         fake_rust_server
             .receive_notification::<lsp::notification::DidSaveTextDocument>()
             .await
             .text_document,
-        lsp::TextDocumentIdentifier::new(
-            lsp::Uri::from_file_path(path!("/dir/Cargo.toml")).unwrap()
-        )
+        lsp::TextDocumentIdentifier::new(lsp::Uri::from_file_path(path!("/dir/test2.rs")).unwrap())
     );
     assert_eq!(
         fake_json_server
@@ -1794,7 +2289,7 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
             .await
             .text_document,
         lsp::TextDocumentIdentifier::new(
-            lsp::Uri::from_file_path(path!("/dir/Cargo.toml")).unwrap()
+            lsp::Uri::from_file_path(path!("/dir/package.json")).unwrap()
         )
     );
 
@@ -1905,7 +2400,6 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
         project.restart_language_servers_for_buffers(
             vec![rust_buffer.clone(), json_buffer.clone()],
             HashSet::default(),
-            true,
             cx,
         );
     });
@@ -1974,6 +2468,128 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
             .await,
         close_message,
     );
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    lsp_store.update(cx, |lsp_store, cx| lsp_store.stop_all_language_servers(cx));
+    cx.run_until_parked();
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 0)
+    });
+
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store
+            .set_user_settings(
+                r#"{"semantic_tokens":"combined","languages":{"Rust":{"language_servers":["replacement-rust-server"]}}}"#,
+                cx,
+            )
+            .unwrap();
+    });
+    cx.run_until_parked();
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 0)
+    });
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![rust_buffer.clone()],
+            HashSet::default(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    lsp_store.read_with(cx, |store, _| {
+        assert_eq!(store.language_server_statuses().count(), 1)
+    });
+    let mut replacement_rust_server = replacement_rust_servers.next().await.unwrap();
+    assert_eq!(
+        initialize_receiver
+            .try_recv()
+            .unwrap()
+            .initialization_options,
+        None
+    );
+
+    let _json_handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&json_buffer, cx)
+    });
+    for (path, text) in [
+        (path!("/dir/test.rs"), "const A: i32 = 12;"),
+        (path!("/dir/later.rs"), "fn later() {}"),
+    ] {
+        let _registration = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement_rust_server
+                .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .await
+                .text_document,
+            lsp::TextDocumentItem {
+                uri: lsp::Uri::from_file_path(path).unwrap(),
+                version: 0,
+                text: text.to_owned(),
+                language_id: "rust".to_owned(),
+            }
+        );
+    }
+    let mut server_id = replacement_rust_server.server.server_id();
+    for semantic_tokens in ["combined", "full"] {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(
+                    &json!({
+                        "semantic_tokens": semantic_tokens,
+                        "languages": { "Rust": { "language_servers": ["replacement-rust-server"] } },
+                        "lsp": { "replacement-rust-server": { "initialization_options": { "check": true } } }
+                    })
+                    .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        lsp_store.read_with(cx, |store, _| {
+            assert_eq!(store.language_server_statuses().count(), 1);
+        });
+        let server = replacement_rust_servers
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("resumed server was not restarted after changing settings");
+        assert_ne!(server.server.server_id(), server_id);
+        server_id = server.server.server_id();
+        let params = initialize_receiver.try_recv().unwrap();
+        assert_eq!(
+            params.initialization_options,
+            Some(json!({ "check": true }))
+        );
+        assert_eq!(
+            params
+                .capabilities
+                .text_document
+                .unwrap()
+                .semantic_tokens
+                .unwrap()
+                .augments_syntax_tokens,
+            Some(semantic_tokens == "combined")
+        );
+    }
+    for servers in [
+        &mut fake_rust_servers,
+        &mut fake_json_servers,
+        &mut replacement_rust_servers,
+    ] {
+        assert_eq!(
+            servers
+                .next()
+                .now_or_never()
+                .flatten()
+                .map(|server| server.server.name()),
+            None,
+        );
+    }
 }
 
 #[gpui::test]
@@ -2052,6 +2668,96 @@ async fn test_late_lsp_adapter_registration(cx: &mut gpui::TestAppContext) {
             &[".".to_string(), "::".to_string()]
         );
     });
+}
+
+#[gpui::test]
+async fn test_language_servers_disabled_by_default(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    async fn running_language_servers(
+        settings_json_contents: serde_json::Value,
+        cx: &mut gpui::TestAppContext,
+    ) -> Vec<LanguageServerName> {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/the-root"),
+            json!({
+                ".zed": {
+                    "settings.json": settings_json_contents.to_string(),
+                },
+                "main.rs": "",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/the-root").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(rust_lang());
+
+        let _default_server = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "default-server",
+                ..Default::default()
+            },
+        );
+        let _opt_in_server = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "opt-in-server",
+                opt_in_languages: HashSet::from_iter([LanguageName::new_static("Rust")]),
+                ..Default::default()
+            },
+        );
+        cx.run_until_parked();
+
+        let (buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/the-root/main.rs"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    lsp_store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .map(|(adapter, _)| adapter.name())
+                        .sorted()
+                        .collect()
+                })
+            })
+        })
+    }
+
+    assert_eq!(
+        running_language_servers(json!({}), cx).await,
+        vec![LanguageServerName::new_static("default-server")],
+        "servers disabled by default must not be started without explicit configuration"
+    );
+    assert_eq!(
+        running_language_servers(
+            json!({ "languages": { "Rust": { "language_servers": ["!default-server", "..."] } } }),
+            cx
+        )
+        .await,
+        Vec::<LanguageServerName>::new(),
+        "the `...` wildcard must not include servers disabled by default"
+    );
+    assert_eq!(
+        running_language_servers(
+            json!({ "languages": { "Rust": { "language_servers": ["opt-in-server", "..."] } } }),
+            cx
+        )
+        .await,
+        vec![
+            LanguageServerName::new_static("default-server"),
+            LanguageServerName::new_static("opt-in-server"),
+        ],
+        "servers disabled by default must start when listed explicitly"
+    );
 }
 
 #[gpui::test]
@@ -3023,7 +3729,7 @@ async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppC
 
     // Restart the server before the diagnostics finish updating.
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers(vec![buffer], HashSet::default(), true, cx);
+        project.restart_language_servers_for_buffers(vec![buffer], HashSet::default(), cx);
     });
     let mut events = cx.events(&project);
 
@@ -3141,12 +3847,7 @@ async fn test_restarting_server_with_diagnostics_published(cx: &mut gpui::TestAp
     });
 
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers(
-            vec![buffer.clone()],
-            HashSet::default(),
-            true,
-            cx,
-        );
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
     });
 
     // The diagnostics are cleared.
@@ -3201,12 +3902,7 @@ async fn test_restarted_server_reporting_invalid_buffer_version(cx: &mut gpui::T
     });
     cx.executor().run_until_parked();
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers(
-            vec![buffer.clone()],
-            HashSet::default(),
-            true,
-            cx,
-        );
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
     });
 
     let mut fake_server = fake_servers.next().await.unwrap();
@@ -3388,7 +4084,7 @@ async fn test_registry_reload_detaches_buffers_from_language_servers(
     language_registry.register_test_language(LanguageConfig {
         name: "Rust".into(),
         matcher: Arc::new(LanguageMatcher {
-            path_suffixes: vec!["rs".to_string()],
+            path_suffixes: vec!["rs".into()],
             ..LanguageMatcher::default()
         }),
         ..LanguageConfig::default()
@@ -3791,6 +4487,119 @@ async fn test_updating_lsp_settings_sends_one_did_change_configuration(
         1,
         "expected exactly one workspace/didChangeConfiguration after a settings change"
     );
+}
+
+#[gpui::test]
+async fn test_removing_worktree_notifies_settings_only_for_local_settings(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/outside"), json!({ "b.rs": "" }))
+        .await;
+    fs.insert_tree(
+        path!("/with_settings"),
+        json!({ ".zed": { "settings.json": r#"{ "tab_size": 8 }"# } }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+
+    let did_change_count = Arc::new(atomic::AtomicUsize::new(0));
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            initializer: Some(Box::new({
+                let did_change_count = did_change_count.clone();
+                move |fake_server| {
+                    fake_server.set_request_handler::<lsp::request::GotoDefinition, _, _>(
+                        |_, _| async move {
+                            Ok(Some(lsp::GotoDefinitionResponse::Scalar(
+                                lsp::Location::new(
+                                    lsp::Uri::from_file_path(path!("/outside/b.rs")).unwrap(),
+                                    lsp::Range::default(),
+                                ),
+                            )))
+                        },
+                    );
+                    fake_server
+                        .handle_notification::<lsp::notification::DidChangeConfiguration, _>({
+                            let did_change_count = did_change_count.clone();
+                            move |_, _| {
+                                did_change_count.fetch_add(1, atomic::Ordering::Release);
+                            }
+                        });
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    let (rs_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let _fake_rust_server = fake_rust_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    did_change_count.store(0, atomic::Ordering::Release);
+
+    let definitions = project
+        .update(cx, |project, cx| project.definitions(&rs_buffer, 0, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    cx.executor().run_until_parked();
+    let invisible_worktree_id = cx.update(|cx| {
+        assert_eq!(definitions.len(), 1);
+        let target_worktree_id = definitions[0]
+            .target
+            .buffer
+            .read(cx)
+            .file()
+            .unwrap()
+            .worktree_id(cx);
+        assert!(
+            project
+                .read(cx)
+                .worktree_for_id(target_worktree_id, cx)
+                .is_some_and(|worktree| !worktree.read(cx).is_visible())
+        );
+        target_worktree_id
+    });
+
+    cx.update(|_| drop(definitions));
+    cx.executor().run_until_parked();
+
+    assert!(project.read_with(cx, |project, cx| {
+        project.worktree_for_id(invisible_worktree_id, cx).is_none()
+    }));
+    assert_eq!(did_change_count.load(atomic::Ordering::Acquire), 0);
+
+    let (worktree_with_settings, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/with_settings"), true, cx)
+        })
+        .await
+        .unwrap();
+    let worktree_with_settings_id =
+        worktree_with_settings.read_with(cx, |worktree, _| worktree.id());
+    drop(worktree_with_settings);
+    cx.executor().run_until_parked();
+    did_change_count.store(0, atomic::Ordering::Release);
+
+    project.update(cx, |project, cx| {
+        project.remove_worktree(worktree_with_settings_id, cx)
+    });
+    cx.executor().run_until_parked();
+
+    assert_eq!(did_change_count.load(atomic::Ordering::Acquire), 1);
 }
 
 #[gpui::test(iterations = 3)]
@@ -4366,6 +5175,15 @@ async fn test_empty_diagnostic_ranges(cx: &mut gpui::TestAppContext) {
                                 ..Diagnostic::default()
                             },
                         ),
+                        DiagnosticEntry::new(
+                            Unclipped(PointUtf16::new(3, 0))..Unclipped(PointUtf16::new(3, 0)),
+                            Diagnostic {
+                                severity: DiagnosticSeverity::ERROR,
+                                message: "syntax error on empty line".into(),
+                                source_kind: DiagnosticSourceKind::Pushed,
+                                ..Diagnostic::default()
+                            },
+                        ),
                     ],
                     cx,
                 )
@@ -4391,6 +5209,13 @@ async fn test_empty_diagnostic_ranges(cx: &mut gpui::TestAppContext) {
                 ("\nlet three = 3;\n", None)
             ]
         );
+
+        let snapshot = buffer.snapshot();
+        let diagnostics = snapshot
+            .diagnostics_in_range::<_, Point>(Point::new(3, 0)..Point::new(3, 0), false)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range, Point::new(3, 0)..Point::new(3, 0));
     });
 }
 
@@ -4704,12 +5529,7 @@ async fn test_diagnostic_summaries_cleared_on_server_restart(cx: &mut gpui::Test
     let mut events = cx.events(&project);
 
     project.update(cx, |project, cx| {
-        project.restart_language_servers_for_buffers(
-            vec![buffer.clone()],
-            HashSet::default(),
-            true,
-            cx,
-        );
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
     });
     cx.executor().run_until_parked();
 
@@ -6852,6 +7672,265 @@ async fn test_definition(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_completion_context_uses_target_server_triggers(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    for dynamic in [false, true] {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "a.ts": "a" })).await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(typescript_lang());
+        let mut servers = Vec::new();
+        for (name, triggers) in [
+            (
+                "typescript",
+                if dynamic {
+                    None
+                } else {
+                    Some(vec![".".into()])
+                },
+            ),
+            ("emmet", Some(vec!["a".into()])),
+            ("no-triggers", None),
+        ] {
+            servers.push(language_registry.register_fake_lsp(
+                "TypeScript",
+                FakeLspAdapter {
+                    name,
+                    capabilities: lsp::ServerCapabilities {
+                        completion_provider: if dynamic && name == "typescript" {
+                            None
+                        } else {
+                            Some(lsp::CompletionOptions {
+                                trigger_characters: triggers,
+                                ..Default::default()
+                            })
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let (buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+            })
+            .await
+            .unwrap();
+        let mut fake_servers = Vec::new();
+        for server in &mut servers {
+            fake_servers.push(server.next().await.unwrap());
+        }
+        cx.run_until_parked();
+
+        if dynamic {
+            fake_servers[0]
+                .request::<lsp::request::RegisterCapability>(
+                    lsp::RegistrationParams {
+                        registrations: vec![lsp::Registration {
+                            id: "completion".into(),
+                            method: "textDocument/completion".into(),
+                            register_options: Some(json!({
+                                "documentSelector": [{ "language": "typescript", "scheme": "file" }],
+                                "triggerCharacters": ["."]
+                            })),
+                        }],
+                    },
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                )
+                .await
+                .into_response()
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.completion_triggers().clone()),
+            BTreeSet::from([".".into(), "a".into()])
+        );
+        let contexts = Arc::new(Mutex::new(HashMap::default()));
+        let _handlers = fake_servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                let contexts = contexts.clone();
+                server.set_request_handler::<lsp::request::Completion, _, _>(move |params, _| {
+                    contexts.lock().insert(index, params.context.unwrap());
+                    async move {
+                        Ok(Some(lsp::CompletionResponse::Array(vec![
+                            lsp::CompletionItem {
+                                label: "available".into(),
+                                ..Default::default()
+                            },
+                        ])))
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (kind, trigger) in [
+            (lsp::CompletionTriggerKind::TRIGGER_CHARACTER, Some("a")),
+            (lsp::CompletionTriggerKind::TRIGGER_CHARACTER, Some(".")),
+            (lsp::CompletionTriggerKind::TRIGGER_CHARACTER, Some("!")),
+            (lsp::CompletionTriggerKind::INVOKED, None),
+            (
+                lsp::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
+                None,
+            ),
+        ] {
+            contexts.lock().clear();
+            let context = lsp::CompletionContext {
+                trigger_kind: kind,
+                trigger_character: trigger.map(str::to_string),
+            };
+            let responses = project
+                .update(cx, |project, cx| {
+                    project.completions(&buffer, 1, context.clone(), cx)
+                })
+                .await
+                .unwrap();
+            assert_eq!(responses.len(), 3);
+            assert!(
+                responses
+                    .iter()
+                    .all(|response| response.completions.len() == 1)
+            );
+
+            let contexts = contexts.lock();
+            assert_eq!(contexts.len(), 3);
+            for (index, own_trigger) in [Some("."), Some("a"), None].into_iter().enumerate() {
+                let expected = if kind == lsp::CompletionTriggerKind::TRIGGER_CHARACTER
+                    && trigger != own_trigger
+                {
+                    DEFAULT_COMPLETION_CONTEXT
+                } else {
+                    context.clone()
+                };
+                assert_eq!(contexts[&index], expected);
+            }
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_completion_context_survives_stale_trigger_replay(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "a." })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let [mut primary_servers, mut secondary_servers] =
+        [("typescript", ":"), ("emmet", ".")].map(|(name, trigger)| {
+            language_registry.register_fake_lsp(
+                "TypeScript",
+                FakeLspAdapter {
+                    name,
+                    capabilities: lsp::ServerCapabilities {
+                        completion_provider: Some(lsp::CompletionOptions {
+                            trigger_characters: Some(vec![trigger.to_string()]),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        });
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .expect("open buffer with both language servers");
+    let primary_server = primary_servers.next().await.expect("start primary server");
+    let secondary_server = secondary_servers
+        .next()
+        .await
+        .expect("start secondary server");
+    cx.run_until_parked();
+
+    let old_version = buffer.read_with(cx, |buffer, _| buffer.version());
+    let stale_operations = buffer
+        .read_with(cx, |buffer, cx| buffer.serialize_ops(Some(old_version), cx))
+        .await
+        .into_iter()
+        .map(language::proto::deserialize_operation)
+        .collect::<Result<Vec<_>>>()
+        .expect("deserialize the collaborator's old buffer state");
+
+    primary_server
+        .request::<lsp::request::RegisterCapability>(
+            lsp::RegistrationParams {
+                registrations: vec![lsp::Registration {
+                    id: "additional-completion-trigger".into(),
+                    method: "textDocument/completion".into(),
+                    register_options: Some(json!({
+                        "documentSelector": [{ "language": "typescript", "scheme": "file" }],
+                        "triggerCharacters": ["."]
+                    })),
+                }],
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("register an additional trigger on the primary server");
+    cx.run_until_parked();
+
+    let contexts = Arc::new(Mutex::new(HashMap::default()));
+    let primary_server_id = primary_server.server.server_id();
+    let secondary_server_id = secondary_server.server.server_id();
+    let _handlers = [primary_server, secondary_server].map(|server| {
+        let contexts = contexts.clone();
+        let server_id = server.server.server_id();
+        server.set_request_handler::<lsp::request::Completion, _, _>(move |params, _| {
+            contexts.lock().insert(server_id, params.context);
+            async move { Ok(Some(lsp::CompletionResponse::Array(Vec::new()))) }
+        })
+    });
+    let context = lsp::CompletionContext {
+        trigger_kind: lsp::CompletionTriggerKind::TRIGGER_CHARACTER,
+        trigger_character: Some(".".to_string()),
+    };
+
+    for replay_stale_state in [false, true] {
+        if replay_stale_state {
+            buffer.update(cx, |buffer, cx| {
+                buffer.apply_ops(stale_operations.clone(), cx);
+            });
+        }
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.completion_triggers().clone()),
+            BTreeSet::from([":".to_string(), ".".to_string()]),
+        );
+
+        contexts.lock().clear();
+        project
+            .update(cx, |project, cx| {
+                project.completions(&buffer, 2, context.clone(), cx)
+            })
+            .await
+            .expect("request completions from both servers");
+        let contexts = contexts.lock();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts.get(&secondary_server_id),
+            Some(&Some(context.clone()))
+        );
+        assert_eq!(
+            contexts.get(&primary_server_id),
+            Some(&Some(context.clone())),
+            "the primary server registered '.', even after stale trigger replay: {replay_stale_state}",
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_completions_with_text_edit(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -7006,11 +8085,11 @@ async fn test_dynamic_completion_registration_honors_document_selector(
 
     assert!(buffer.read_with(cx, |buffer, _| buffer.completion_triggers().is_empty()));
 
-    let completion_request_count = Arc::new(atomic::AtomicUsize::new(0));
+    let completion_contexts = Arc::new(Mutex::new(Vec::new()));
     let _completion_requests = fake_server.set_request_handler::<lsp::request::Completion, _, _>({
-        let completion_request_count = completion_request_count.clone();
-        move |_, _| {
-            completion_request_count.fetch_add(1, atomic::Ordering::SeqCst);
+        let completion_contexts = completion_contexts.clone();
+        move |params, _| {
+            completion_contexts.lock().push(params.context.unwrap());
             async move {
                 Ok(Some(lsp::CompletionResponse::Array(vec![
                     lsp::CompletionItem {
@@ -7029,7 +8108,7 @@ async fn test_dynamic_completion_registration_honors_document_selector(
         .await
         .unwrap();
     assert!(completions.is_empty());
-    assert_eq!(completion_request_count.load(atomic::Ordering::SeqCst), 0);
+    assert!(completion_contexts.lock().is_empty());
 
     fake_server
         .request::<lsp::request::RegisterCapability>(
@@ -7065,19 +8144,37 @@ async fn test_dynamic_completion_registration_honors_document_selector(
         BTreeSet::from([":".to_string()])
     );
 
-    let completions = project
-        .update(cx, |project, cx| {
-            project.completions(&buffer, 15, DEFAULT_COMPLETION_CONTEXT, cx)
-        })
-        .await
-        .unwrap()
-        .into_iter()
-        .flat_map(|response| response.completions)
-        .collect::<Vec<_>>();
+    let colon_context = lsp::CompletionContext {
+        trigger_kind: lsp::CompletionTriggerKind::TRIGGER_CHARACTER,
+        trigger_character: Some(":".to_string()),
+    };
+    for (trigger_character, expected_context) in [
+        (":", colon_context.clone()),
+        (".", DEFAULT_COMPLETION_CONTEXT),
+    ] {
+        let completions = project
+            .update(cx, |project, cx| {
+                project.completions(
+                    &buffer,
+                    15,
+                    lsp::CompletionContext {
+                        trigger_kind: lsp::CompletionTriggerKind::TRIGGER_CHARACTER,
+                        trigger_character: Some(trigger_character.to_string()),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|response| response.completions)
+            .collect::<Vec<_>>();
 
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].new_text, "matched");
-    assert_eq!(completion_request_count.load(atomic::Ordering::SeqCst), 1);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].new_text, "matched");
+        assert_eq!(completion_contexts.lock().last(), Some(&expected_context));
+    }
+    assert_eq!(completion_contexts.lock().len(), 2);
 
     fake_server
         .request::<lsp::request::RegisterCapability>(
@@ -7134,12 +8231,22 @@ async fn test_dynamic_completion_registration_honors_document_selector(
     );
     let completions = project
         .update(cx, |project, cx| {
-            project.completions(&buffer, 15, DEFAULT_COMPLETION_CONTEXT, cx)
+            project.completions(&buffer, 15, colon_context, cx)
         })
         .await
         .unwrap();
     assert_eq!(completions.len(), 1);
-    assert_eq!(completion_request_count.load(atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        completion_contexts.lock().as_slice(),
+        &[
+            lsp::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(":".to_string()),
+            },
+            DEFAULT_COMPLETION_CONTEXT,
+            DEFAULT_COMPLETION_CONTEXT,
+        ]
+    );
 
     fake_server
         .request::<lsp::request::UnregisterCapability>(
@@ -7164,7 +8271,7 @@ async fn test_dynamic_completion_registration_honors_document_selector(
         .await
         .unwrap();
     assert!(completions.is_empty());
-    assert_eq!(completion_request_count.load(atomic::Ordering::SeqCst), 2);
+    assert_eq!(completion_contexts.lock().len(), 3);
 }
 
 #[gpui::test]
@@ -7698,6 +8805,296 @@ async fn test_completions_without_edit_ranges(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_completions_without_edit_ranges_after_concurrent_edits(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "TypeScript",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions::default()),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .expect("open buffer with the language server");
+    let fake_server = fake_language_servers
+        .next()
+        .await
+        .expect("start the language server");
+    cx.executor().run_until_parked();
+    fake_server.set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move {
+        Ok(Some(lsp::CompletionResponse::Array(vec![
+            lsp::CompletionItem {
+                label: String::from("foobar"),
+                ..lsp::CompletionItem::default()
+            },
+        ])))
+    });
+
+    let long_word = "a".repeat(128);
+    let long_word_continued = format!("{long_word}a");
+    for (text, position, edit, expected_ranges) in [
+        ("keep foo", 8, (4..8, ""), None),
+        ("keep foo bar", 8, (0..0, "x\n"), Some(("foo", "foo"))),
+        ("keep foo bar", 8, (8..8, " baz"), None),
+        ("keep foo bar", 7, (5..5, " "), Some(("foo", "fo"))),
+        ("keep 𝒳oo bar", 11, (5..5, "\t"), Some(("𝒳oo", "𝒳oo"))),
+        ("foobar", 4, (3..4, ""), Some(("fooar", "foo"))),
+        ("foo", 3, (0..1, ""), Some(("oo", "oo"))),
+        ("bar", 3, (0..0, "foo"), Some(("foobar", "foobar"))),
+        ("keep foo bar", 8, (4..5, ""), None),
+        ("keep foo bar", 8, (8..9, ""), Some(("foobar", "foo"))),
+        ("keep   bar", 6, (5..6, ""), None),
+        (
+            long_word.as_str(),
+            128,
+            (128..128, "a"),
+            Some((long_word_continued.as_str(), long_word_continued.as_str())),
+        ),
+        ("foo.", 4, (4..4, "b"), Some(("b", "b"))),
+        ("foo.", 4, (3..4, ""), None),
+    ] {
+        buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+        let completions = project.update(cx, |project, cx| {
+            let completions =
+                project.completions(&buffer, position, DEFAULT_COMPLETION_CONTEXT, cx);
+            buffer.update(cx, |buffer, cx| buffer.edit([edit.clone()], None, cx));
+            completions
+        });
+        let completions = completions.await.expect("request completions");
+        assert_eq!(
+            completion_edit_texts(completions, &buffer, cx),
+            expected_ranges
+                .into_iter()
+                .map(|(replaced, inserted)| (replaced.to_string(), Some(inserted.to_string())))
+                .collect::<Vec<_>>(),
+            "completions in {text:?} after edit {edit:?}",
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_completions_without_edit_ranges_after_reparse(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: LanguageName::new("TypeScript"),
+                matcher: Arc::new(LanguageMatcher {
+                    path_suffixes: vec![SharedString::from("ts")],
+                    ..LanguageMatcher::default()
+                }),
+                overrides: HashMap::from_iter([(
+                    String::from("string"),
+                    LanguageConfigOverride {
+                        completion_query_characters: Override::Set(HashSet::from_iter(['-'])),
+                        ..LanguageConfigOverride::default()
+                    },
+                )]),
+                ..LanguageConfig::default()
+            },
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        )
+        .with_override_query("(string) @string")
+        .expect("parse the override query"),
+    ));
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "TypeScript",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions::default()),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .expect("open buffer with the language server");
+    let fake_server = fake_language_servers
+        .next()
+        .await
+        .expect("start the language server");
+    cx.executor().run_until_parked();
+    buffer.update(cx, |buffer, _| buffer.set_sync_parse_timeout(None));
+
+    for (text, edits_before_request, position, edits_after_request, expected) in [
+        (
+            "let a = alpha-bet;",
+            vec![(8..8, "\""), (17..17, "\"")],
+            18,
+            vec![(18..18, "a")],
+            "alpha-beta",
+        ),
+        (
+            "let a = \"alpha-bet \";",
+            vec![(8..9, "")],
+            17,
+            Vec::new(),
+            "bet",
+        ),
+    ] {
+        buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+        cx.executor().run_until_parked();
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let mut respond_rx = Some(respond_rx);
+        fake_server.set_request_handler::<lsp::request::Completion, _, _>(move |_, _| {
+            let respond_rx = respond_rx.take();
+            async move {
+                if let Some(respond_rx) = respond_rx {
+                    respond_rx.await?;
+                }
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    lsp::CompletionItem {
+                        label: String::from("alpha-beta"),
+                        ..lsp::CompletionItem::default()
+                    },
+                ])))
+            }
+        });
+
+        let completions = project.update(cx, |project, cx| {
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits_before_request.clone(), None, cx);
+            });
+            let completions =
+                project.completions(&buffer, position, DEFAULT_COMPLETION_CONTEXT, cx);
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits_after_request.clone(), None, cx);
+            });
+            completions
+        });
+        cx.executor().run_until_parked();
+        respond_tx
+            .send(())
+            .expect("the language server should wait for the response signal");
+        let completions = completions.await.expect("request completions");
+        assert_eq!(
+            completion_edit_texts(completions, &buffer, cx),
+            vec![(String::from(expected), Some(String::from(expected)))],
+            "completions in {text:?}",
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_completions_without_edit_ranges_after_edits_between_servers(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.ts": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(typescript_lang());
+    let [mut fast_servers, mut slow_servers] = ["fast", "slow"].map(|name| {
+        language_registry.register_fake_lsp(
+            "TypeScript",
+            FakeLspAdapter {
+                name,
+                capabilities: lsp::ServerCapabilities {
+                    completion_provider: Some(lsp::CompletionOptions::default()),
+                    ..lsp::ServerCapabilities::default()
+                },
+                ..FakeLspAdapter::default()
+            },
+        )
+    });
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.ts"), cx)
+        })
+        .await
+        .expect("open buffer with both language servers");
+    let fast_server = fast_servers.next().await.expect("start the fast server");
+    let slow_server = slow_servers.next().await.expect("start the slow server");
+    cx.executor().run_until_parked();
+    fast_server.set_request_handler::<lsp::request::Completion, _, _>(|_, _| async move {
+        Ok(Some(lsp::CompletionResponse::Array(vec![
+            lsp::CompletionItem {
+                label: String::from("kept"),
+                text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 4)),
+                    new_text: String::from("kept"),
+                })),
+                ..lsp::CompletionItem::default()
+            },
+            lsp::CompletionItem {
+                label: String::from("foobar"),
+                ..lsp::CompletionItem::default()
+            },
+        ])))
+    });
+
+    for (edit, expected_edits, expected_incomplete) in [
+        ((5..8, ""), vec![("keep", None)], true),
+        (
+            (5..5, "\t"),
+            vec![("keep", None), ("foo", Some("foo"))],
+            false,
+        ),
+    ] {
+        buffer.update(cx, |buffer, cx| buffer.set_text("keep foo bar", cx));
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let mut respond_rx = Some(respond_rx);
+        slow_server.set_request_handler::<lsp::request::Completion, _, _>(move |_, _| {
+            let respond_rx = respond_rx.take();
+            async move {
+                if let Some(respond_rx) = respond_rx {
+                    respond_rx.await?;
+                }
+                Ok(Some(lsp::CompletionResponse::Array(Vec::new())))
+            }
+        });
+        let completions = project.update(cx, |project, cx| {
+            project.completions(&buffer, 8, DEFAULT_COMPLETION_CONTEXT, cx)
+        });
+        cx.executor().run_until_parked();
+        buffer.update(cx, |buffer, cx| buffer.edit([edit.clone()], None, cx));
+        respond_tx
+            .send(())
+            .expect("the slow server should wait for the response signal");
+        let completions = completions.await.expect("request completions");
+        assert_eq!(
+            completions.iter().any(|response| response.is_incomplete),
+            expected_incomplete,
+            "incompleteness after edit {edit:?}",
+        );
+        assert_eq!(
+            completion_edit_texts(completions, &buffer, cx),
+            expected_edits
+                .into_iter()
+                .map(|(replaced, inserted)| (replaced.to_string(), inserted.map(String::from)))
+                .collect::<Vec<_>>(),
+            "completions after edit {edit:?}",
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_completions_with_carriage_returns(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -7947,6 +9344,88 @@ async fn test_range_formatting_prefers_range_capable_current_server(cx: &mut gpu
         0,
         "expected manual range formatting not to use the full-format-only server",
     );
+}
+
+#[gpui::test]
+async fn test_full_buffer_formatting_edit_preserves_unchanged_anchors(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.formatter = Some(FormatterList::Single(
+                    Formatter::LanguageServer(settings::LanguageServerFormatterSpecifier::Current),
+                ));
+            });
+        });
+    });
+
+    let initial_text = "fn main() {\n    println!(\"🙂\");  \n}\n";
+    let formatted_text = "fn main() {\n    println!(\"🙂\");\n}\n";
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "main.rs": initial_text }))
+        .await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_language_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                document_formatting_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_language_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+
+    let _format_requests = fake_server.set_request_handler::<lsp::request::Formatting, _, _>({
+        let formatted_text = formatted_text.to_string();
+        move |_, _| {
+            let formatted_text = formatted_text.clone();
+            async move {
+                Ok(Some(vec![lsp::TextEdit {
+                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(3, 0)),
+                    new_text: formatted_text,
+                }]))
+            }
+        }
+    });
+    let unchanged_anchor = buffer.read_with(cx, |buffer, _| {
+        buffer.anchor_before(initial_text.find("println!").unwrap())
+    });
+
+    project
+        .update(cx, |project, cx| {
+            project.format(
+                HashSet::from_iter([buffer.clone()]),
+                project::lsp_store::LspFormatTarget::Buffers,
+                false,
+                project::lsp_store::FormatTrigger::Manual,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), formatted_text);
+        assert_eq!(
+            unchanged_anchor.to_offset(buffer),
+            formatted_text.find("println!").unwrap()
+        );
+    });
 }
 
 #[gpui::test(iterations = 10)]
@@ -8607,7 +10086,7 @@ async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
         }
     }));
 
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [dir.path()], cx).await;
 
     let buffer_for_path = |path: &'static str, cx: &mut gpui::TestAppContext| {
         let buffer = project.update(cx, |p, cx| p.open_local_buffer(dir.path().join(path), cx));
@@ -8761,7 +10240,7 @@ async fn test_recreated_directory_receives_child_events(cx: &mut gpui::TestAppCo
     cx.executor().allow_parking();
 
     let dir = TempTree::new(json!({}));
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [dir.path()], cx).await;
     let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
 
     tree.flush_fs_events(cx).await;
@@ -10796,7 +12275,7 @@ async fn test_dynamic_formatting_registrations_honor_document_selectors(
 }
 
 #[gpui::test]
-async fn test_dynamic_formatting_registration_with_pattern_only_selector_fails_open(
+async fn test_dynamic_formatting_registration_with_pattern_only_selector(
     cx: &mut gpui::TestAppContext,
 ) {
     init_test(cx);
@@ -10843,40 +12322,55 @@ async fn test_dynamic_formatting_registration_with_pattern_only_selector_fails_o
         }
     });
 
-    fake_server
-        .request::<lsp::request::RegisterCapability>(
-            lsp::RegistrationParams {
-                registrations: vec![lsp::Registration {
-                    id: "pattern-only-formatting".to_string(),
-                    method: "textDocument/formatting".to_string(),
-                    register_options: Some(json!({
-                        "documentSelector": [{ "pattern": "**/*.nomatch" }],
-                    })),
-                }],
-            },
-            DEFAULT_LSP_REQUEST_TIMEOUT,
-        )
-        .await
-        .into_response()
-        .unwrap();
-    cx.executor().run_until_parked();
-
-    project
-        .update(cx, |project, cx| {
-            project.format(
-                HashSet::from_iter([buffer.clone()]),
-                project::lsp_store::LspFormatTarget::Buffers,
-                false,
-                project::lsp_store::FormatTrigger::Manual,
-                cx,
+    let register_formatting = async |id: &str, pattern: &str| {
+        fake_server
+            .request::<lsp::request::RegisterCapability>(
+                lsp::RegistrationParams {
+                    registrations: vec![lsp::Registration {
+                        id: id.to_string(),
+                        method: "textDocument/formatting".to_string(),
+                        register_options: Some(json!({
+                            "documentSelector": [{ "pattern": pattern }],
+                        })),
+                    }],
+                },
+                DEFAULT_LSP_REQUEST_TIMEOUT,
             )
-        })
-        .await
-        .unwrap();
+            .await
+            .into_response()
+            .unwrap();
+    };
+    let format = async |cx: &mut gpui::TestAppContext| {
+        project
+            .update(cx, |project, cx| {
+                project.format(
+                    HashSet::from_iter([buffer.clone()]),
+                    project::lsp_store::LspFormatTarget::Buffers,
+                    false,
+                    project::lsp_store::FormatTrigger::Manual,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+    };
+
+    register_formatting("pattern-only-formatting", "**/*.nomatch").await;
+    cx.executor().run_until_parked();
+    format(cx).await;
+    assert_eq!(
+        format_request_count.load(atomic::Ordering::SeqCst),
+        0,
+        "expected a pattern-only filter not matching the buffer's path not to route the formatting request",
+    );
+
+    register_formatting("matching-pattern-formatting", "**/*.rs").await;
+    cx.executor().run_until_parked();
+    format(cx).await;
     assert_eq!(
         format_request_count.load(atomic::Ordering::SeqCst),
         1,
-        "expected a pattern-only filter to fail open and route the formatting request",
+        "expected a pattern-only filter matching the buffer's path to route the formatting request",
     );
 }
 
@@ -11614,6 +13108,27 @@ async fn test_search(cx: &mut gpui::TestAppContext) {
             (path!("dir/three.rs").to_string(), vec![37..40]),
             (path!("dir/four.rs").to_string(), vec![25..28, 36..39])
         ])
+    );
+
+    assert_eq!(
+        search(
+            &project,
+            SearchQuery::text(
+                "THREE",
+                false,
+                true,
+                false,
+                Default::default(),
+                Default::default(),
+                false,
+                None,
+            )
+            .unwrap(),
+            cx
+        )
+        .await
+        .unwrap(),
+        HashMap::from_iter([(path!("dir/three.rs").to_string(), vec![6..11])])
     );
 }
 
@@ -12432,15 +13947,15 @@ async fn test_visibility_for_paths_in_gitignored_dirs(cx: &mut gpui::TestAppCont
         let file_in_ignored_dir = PathBuf::from(path!("/dir/.checkouts/worktrees/foo/README.md"));
 
         assert_eq!(
-            project.visibility_for_paths(std::slice::from_ref(&root), true, cx),
+            project.visibility_for_paths(std::slice::from_ref(&root.as_path()), true, cx),
             Some(true)
         );
         assert_eq!(
-            project.visibility_for_paths(std::slice::from_ref(&file), true, cx),
+            project.visibility_for_paths(std::slice::from_ref(&file.as_path()), true, cx),
             Some(true)
         );
         assert_eq!(
-            project.visibility_for_subpaths(std::slice::from_ref(&file), cx),
+            project.visibility_for_subpaths(std::slice::from_ref(&file.as_path()), cx),
             Some(true)
         );
 
@@ -12449,17 +13964,17 @@ async fn test_visibility_for_paths_in_gitignored_dirs(cx: &mut gpui::TestAppCont
         // opening an unrelated path.
         for path in [&ignored_dir, &file_in_ignored_dir] {
             assert_eq!(
-                project.visibility_for_paths(std::slice::from_ref(path), true, cx),
+                project.visibility_for_paths(std::slice::from_ref(&path.as_path()), true, cx),
                 None,
                 "{path:?} should not be considered contained"
             );
             assert_eq!(
-                project.visibility_for_paths(std::slice::from_ref(path), false, cx),
+                project.visibility_for_paths(std::slice::from_ref(&path.as_path()), false, cx),
                 None,
                 "{path:?} should not be considered contained"
             );
             assert_eq!(
-                project.visibility_for_subpaths(std::slice::from_ref(path), cx),
+                project.visibility_for_subpaths(std::slice::from_ref(&path.as_path()), cx),
                 None,
                 "{path:?} should not be considered a contained subpath"
             );
@@ -14934,6 +16449,93 @@ async fn test_staged_diff_without_unstaged_diff(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_diffs_opened_together(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            ".git": {},
+            "same.txt": "same working\n",
+            "staged.txt": "staged working\n",
+            "untracked.txt": "untracked working\n",
+            "unstaged.txt": "unstaged working\n",
+        }),
+    )
+    .await;
+    fs.set_head_for_repo(
+        path!("/dir/.git").as_ref(),
+        &[
+            ("same.txt", "same head\n".into()),
+            ("staged.txt", "staged head\n".into()),
+            ("unstaged.txt", "unstaged head\n".into()),
+        ],
+        "deadbeef",
+    );
+    fs.set_index_for_repo(
+        path!("/dir/.git").as_ref(),
+        &[
+            ("same.txt", "same head\n".into()),
+            ("staged.txt", "staged index\n".into()),
+            ("unstaged.txt", "unstaged index\n".into()),
+        ],
+    );
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let mut buffers = Vec::new();
+    for name in ["same.txt", "staged.txt", "untracked.txt", "unstaged.txt"] {
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(Path::new(path!("/dir")).join(name), cx)
+            })
+            .await
+            .unwrap();
+        buffers.push(buffer);
+    }
+
+    // Requested in one update, so all four loads share one job.
+    let (uncommitted_diffs, unstaged_diff) = project.update(cx, |project, cx| {
+        (
+            buffers[..3]
+                .iter()
+                .map(|buffer| project.open_uncommitted_diff(buffer.clone(), cx))
+                .collect::<Vec<_>>(),
+            project.open_unstaged_diff(buffers[3].clone(), cx),
+        )
+    });
+    let uncommitted_diffs = future::try_join_all(uncommitted_diffs).await.unwrap();
+    let unstaged_diff = unstaged_diff.await.unwrap();
+    cx.run_until_parked();
+
+    let base_texts = uncommitted_diffs
+        .iter()
+        .map(|diff| {
+            diff.read_with(cx, |diff, cx| {
+                let index_text = diff
+                    .secondary_diff()
+                    .and_then(|unstaged_diff| unstaged_diff.read(cx).base_text_string(cx));
+                (diff.base_text_string(cx), index_text)
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        base_texts,
+        [
+            (Some("same head\n".into()), Some("same head\n".into())),
+            (Some("staged head\n".into()), Some("staged index\n".into())),
+            (None, None),
+        ]
+    );
+    unstaged_diff.read_with(cx, |diff, cx| {
+        assert_eq!(
+            diff.base_text_string(cx).as_deref(),
+            Some("unstaged index\n")
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_uncommitted_diff_for_buffer(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -16170,7 +17772,6 @@ async fn test_staging_random_hunks_with_edits(
         )
     }
 
-    #[allow(clippy::type_complexity)]
     fn capture_diff_state(
         diff: &Entity<BufferDiff>,
         cx: &mut gpui::TestAppContext,
@@ -16735,12 +18336,7 @@ async fn test_staging_hunk_preserve_executable_permission(cx: &mut gpui::TestApp
     git_commit("Initial commit", &repo);
     std::fs::write(&file_path, file_contents).unwrap();
 
-    let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
-        [root.path()],
-        cx,
-    )
-    .await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
 
     let buffer = project
         .update(cx, |project, cx| {
@@ -16975,12 +18571,7 @@ async fn test_git_repository_status(cx: &mut gpui::TestAppContext) {
     std::fs::remove_file(work_dir.join("d.txt")).unwrap();
     std::fs::write(work_dir.join("a.txt"), "aa").unwrap();
 
-    let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
-        [root.path()],
-        cx,
-    )
-    .await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -17262,12 +18853,7 @@ async fn test_git_events_after_project_excludes_dot_git(cx: &mut gpui::TestAppCo
     git_commit("Initial commit", &repo);
     git_branch("other-branch", &repo);
 
-    let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
-        [work_dir.as_path()],
-        cx,
-    )
-    .await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [work_dir.as_path()], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -17354,12 +18940,7 @@ async fn test_git_status_postprocessing(cx: &mut gpui::TestAppContext) {
     // `sub` is a nested git repository.
     let _sub = git_init(&work_dir.join("sub"));
 
-    let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
-        [root.path()],
-        cx,
-    )
-    .await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -18050,6 +19631,516 @@ async fn test_project_group_keys_match_for_bare_repo_linked_worktrees(
 }
 
 #[gpui::test]
+async fn test_project_group_keys_for_delta_checkouts(
+    executor: gpui::BackgroundExecutor,
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    let source_objects = format!("{}\n", path!("/root/my-repo/.git/objects"));
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "my-repo": {
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n",
+                    "objects": {},
+                },
+                ".delta": {
+                    "clones": {
+                        "aliased": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/aliased\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!("/root/alias/.git/objects")),
+                            },
+                        },
+                        "submodule-source": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/submodule\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!("/root/super/.git/modules/sub/objects")),
+                            },
+                        },
+                        "managed": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/managed\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!("/root/managed/zed.git/objects")),
+                            },
+                        },
+                        "nested": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/nested\n",
+                                "config": "[core]\n\tbare = false\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!(
+                                    "/root/my-repo/.delta/clones/abc/my-repo.git/objects"
+                                )),
+                            },
+                        },
+                        "orphan": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/orphan\n",
+                                "config": "[core]\n\tbare = false\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!("/root/my-repo/.git/objects")),
+                            },
+                        },
+                        "relinked": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/feature\n",
+                                "config": "[core]\n\tbare = false\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": alternates(path!("/root/my-repo/.git/objects")),
+                            },
+                        },
+                        "abc": {
+                            "my-repo.git": {
+                                "HEAD": "ref: refs/heads/feature\n",
+                                "config": "[core]\n\tbare = false\n",
+                                "worktrees": {
+                                    "linked": {
+                                        "HEAD": "ref: refs/heads/linked\n",
+                                        "commondir": "../..",
+                                        "gitdir": path!("/root/my-repo-linked/my-repo/.git"),
+                                    },
+                                },
+                                "delta": { "copy-baseline": "" },
+                                "objects": { "info": { "alternates": source_objects.clone() } },
+                            },
+                        },
+                    },
+                    "worktrees": {
+                        "aliased": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/aliased/my-repo.git")
+                                ),
+                            },
+                        },
+                        "submodule-source": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/submodule-source/my-repo.git")
+                                ),
+                            },
+                        },
+                        "nested": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/nested/my-repo.git")
+                                ),
+                            },
+                        },
+                        "managed": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/managed/my-repo.git")
+                                ),
+                                "file.txt": "managed",
+                            },
+                        },
+                        "relinked": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/relinked/my-repo.git")
+                                ),
+                                "file.txt": "relinked",
+                            },
+                        },
+                        "abc": {
+                            "my-repo": {
+                                ".git": format!(
+                                    "gitdir: {}\n",
+                                    path!("/root/my-repo/.delta/clones/abc/my-repo.git")
+                                ),
+                                "file.txt": "checkout",
+                                "src": { "main.rs": "" },
+                            },
+                        },
+                    },
+                },
+                "file.txt": "main",
+            },
+            "my-repo-linked": {
+                "my-repo": {
+                    ".git": format!(
+                        "gitdir: {}\n",
+                        path!("/root/my-repo/.delta/clones/abc/my-repo.git/worktrees/linked")
+                    ),
+                    "file.txt": "linked",
+                },
+            },
+            "managed": {
+                "zed.git": { "HEAD": "ref: refs/heads/main\n" },
+            },
+            "other": {
+                ".git": { "HEAD": "ref: refs/heads/main\n" },
+            },
+            "super": {
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n",
+                    "modules": { "sub": { "HEAD": "ref: refs/heads/main\n" } },
+                },
+            },
+            "independent-project.git": {
+                "HEAD": "ref: refs/heads/main\n",
+                "config": "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://example.com/independent-project.git\n",
+                "objects": { "info": { "alternates": source_objects } },
+            },
+            "independent-project": {
+                ".git": format!("gitdir: {}\n", path!("/root/independent-project.git")),
+                "file.txt": "independent",
+            },
+            "symlinked": {
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n",
+                    "objects": {},
+                },
+            },
+            "storage": {
+                "clones": {
+                    "abc": {
+                        "symlinked.git": {
+                            "HEAD": "ref: refs/heads/feature\n",
+                            "delta": { "copy-baseline": "" },
+                            "objects": alternates(path!("/root/symlinked/.git/objects")),
+                        },
+                    },
+                },
+                "worktrees": {
+                    "abc": {
+                        "symlinked": {
+                            ".git": format!(
+                                "gitdir: {}\n",
+                                path!("/root/symlinked/.delta/clones/abc/symlinked.git")
+                            ),
+                            "file.txt": "symlinked",
+                        },
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+    fs.insert_symlink(
+        path!("/root/symlinked/.delta"),
+        PathBuf::from(path!("/root/storage")),
+    )
+    .await;
+    fs.insert_symlink(path!("/root/alias"), PathBuf::from(path!("/root/my-repo")))
+        .await;
+
+    let project_main = Project::test(fs.clone(), [path!("/root/my-repo").as_ref()], cx).await;
+    let project_checkout = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/abc/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let subfolder_path = Path::new(path!("/root/my-repo/.delta/worktrees/abc/my-repo/src"));
+    let project_subfolder = Project::test(fs.clone(), [subfolder_path], cx).await;
+    let project_linked = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo-linked/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_aliased = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/aliased/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_submodule_source = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/submodule-source/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_nested = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/nested/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_managed = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/managed/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_relinked = Project::test(
+        fs.clone(),
+        [path!("/root/my-repo/.delta/worktrees/relinked/my-repo").as_ref()],
+        cx,
+    )
+    .await;
+    let project_independent = Project::test(
+        fs.clone(),
+        [path!("/root/independent-project").as_ref()],
+        cx,
+    )
+    .await;
+    let project_symlinked = Project::test(
+        fs.clone(),
+        [path!("/root/storage/worktrees/abc/symlinked").as_ref()],
+        cx,
+    )
+    .await;
+
+    let projects = [
+        &project_main,
+        &project_checkout,
+        &project_subfolder,
+        &project_aliased,
+        &project_submodule_source,
+        &project_nested,
+        &project_linked,
+        &project_managed,
+        &project_relinked,
+        &project_independent,
+        &project_symlinked,
+    ];
+    for project in projects {
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+    }
+    cx.run_until_parked();
+
+    let mut discovered_group_paths = Vec::new();
+    let mut live_group_paths = Vec::new();
+    for project in projects {
+        let (folder_paths, main_paths) = project_worktree_paths(project, cx);
+        for (folder_path, main_path) in folder_paths.into_iter().zip(main_paths) {
+            let has_dot_git = fs
+                .metadata(&folder_path.join(".git"))
+                .await
+                .unwrap()
+                .is_some();
+            discovered_group_paths.push(
+                project::git_store::discover_root_repository_group_path(&folder_path, fs.as_ref())
+                    .await,
+            );
+            live_group_paths.push(has_dot_git.then_some(main_path));
+        }
+    }
+    assert_eq!(discovered_group_paths, live_group_paths);
+
+    assert_eq!(
+        project_worktree_paths(&project_main, cx),
+        (
+            vec![PathBuf::from(path!("/root/my-repo"))],
+            vec![PathBuf::from(path!("/root/my-repo"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_checkout, cx),
+        (
+            vec![PathBuf::from(path!(
+                "/root/my-repo/.delta/worktrees/abc/my-repo"
+            ))],
+            vec![PathBuf::from(path!("/root/my-repo"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_subfolder, cx),
+        (
+            vec![subfolder_path.to_path_buf()],
+            vec![PathBuf::from(path!("/root/my-repo"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_linked, cx),
+        (
+            vec![PathBuf::from(path!("/root/my-repo-linked/my-repo"))],
+            vec![PathBuf::from(path!("/root/my-repo"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_managed, cx).1,
+        vec![PathBuf::from(path!("/root/managed/zed.git"))]
+    );
+    assert_eq!(
+        project_worktree_paths(&project_relinked, cx),
+        (
+            vec![PathBuf::from(path!(
+                "/root/my-repo/.delta/worktrees/relinked/my-repo"
+            ))],
+            vec![PathBuf::from(path!("/root/my-repo"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_independent, cx),
+        (
+            vec![PathBuf::from(path!("/root/independent-project"))],
+            vec![PathBuf::from(path!("/root/independent-project.git"))],
+        )
+    );
+    assert_eq!(
+        project_worktree_paths(&project_symlinked, cx).1,
+        vec![PathBuf::from(path!("/root/symlinked"))]
+    );
+
+    assert_eq!(
+        (
+            project_worktree_paths(&project_aliased, cx).1,
+            project_worktree_paths(&project_submodule_source, cx).1,
+            project_worktree_paths(&project_nested, cx).1,
+        ),
+        (
+            vec![PathBuf::from(path!("/root/my-repo"))],
+            vec![PathBuf::from(path!(
+                "/root/my-repo/.delta/clones/submodule-source/my-repo.git"
+            ))],
+            vec![PathBuf::from(path!(
+                "/root/my-repo/.delta/clones/nested/my-repo.git"
+            ))],
+        )
+    );
+
+    fs.insert_file(
+        path!("/root/my-repo/.delta/clones/orphan/my-repo.git/objects/info/alternates"),
+        format!("{}\n", path!("/root/my-repo/.git/objects")).into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+    let mut main_project_repository_paths = project_main.read_with(cx, |project, cx| {
+        project
+            .repositories(cx)
+            .values()
+            .map(|repository| repository.read(cx).work_directory_abs_path.to_path_buf())
+            .collect::<Vec<_>>()
+    });
+    main_project_repository_paths.sort();
+    assert_eq!(
+        main_project_repository_paths,
+        [
+            path!("/root/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/abc/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/aliased/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/managed/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/nested/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/relinked/my-repo"),
+            path!("/root/my-repo/.delta/worktrees/submodule-source/my-repo"),
+        ]
+        .map(PathBuf::from)
+    );
+
+    let clone_path = Path::new(path!("/root/my-repo/.delta/clones/abc/my-repo.git"));
+    let mut main_paths_without_input = Vec::new();
+    for (input_path, contents) in [
+        (
+            "objects/info/alternates",
+            format!("{}\n", path!("/root/my-repo/.git/objects")),
+        ),
+        ("delta/copy-baseline", String::new()),
+    ] {
+        let input_path = clone_path.join(input_path);
+        fs.remove_file(&input_path, RemoveOptions::default())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        main_paths_without_input.push(project_worktree_paths(&project_checkout, cx).1);
+        fs.insert_file(&input_path, contents.into_bytes()).await;
+        cx.run_until_parked();
+    }
+    let objects_path = clone_path.join("objects");
+    let info_path = objects_path.join("info");
+    let old_info_path = objects_path.join("info.old");
+    let next_info_path = objects_path.join("info.next");
+    fs.insert_tree(
+        &next_info_path,
+        json!({ "alternates": format!("{}\n", path!("/root/other/.git/objects")) }),
+    )
+    .await;
+    cx.run_until_parked();
+    fs.pause_events();
+    fs.rename(&info_path, &old_info_path, RenameOptions::default())
+        .await
+        .unwrap();
+    fs.rename(&next_info_path, &info_path, RenameOptions::default())
+        .await
+        .unwrap();
+    fs.clear_buffered_events();
+    fs.emit_fs_event(info_path.clone(), Some(PathEventKind::Changed));
+    fs.unpause_events_and_flush();
+    cx.run_until_parked();
+    let main_paths_after_rename = project_worktree_paths(&project_checkout, cx).1;
+    fs.remove_dir(
+        &info_path,
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    fs.rename(&old_info_path, &info_path, RenameOptions::default())
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        (
+            main_paths_after_rename,
+            project_worktree_paths(&project_checkout, cx).1
+        ),
+        (
+            vec![PathBuf::from(path!("/root/other"))],
+            vec![PathBuf::from(path!("/root/my-repo"))]
+        )
+    );
+    assert_eq!(
+        main_paths_without_input,
+        vec![vec![clone_path.to_path_buf()]; 2]
+    );
+
+    fs.insert_tree(
+        path!("/root/independent-project.git/delta"),
+        json!({ "copy-baseline": "" }),
+    )
+    .await;
+    cx.run_until_parked();
+    assert_eq!(
+        project_worktree_paths(&project_independent, cx).1,
+        vec![PathBuf::from(path!("/root/my-repo"))]
+    );
+
+    let relinked_clone_path = Path::new(path!("/root/my-repo/.delta/clones/relinked/my-repo.git"));
+    fs.remove_file(
+        &relinked_clone_path.join("delta/copy-baseline"),
+        RemoveOptions::default(),
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    let main_paths_without_marker = project_worktree_paths(&project_relinked, cx).1;
+    fs.emit_fs_event(
+        path!("/root/my-repo/.delta/worktrees/relinked/my-repo"),
+        Some(PathEventKind::Rescan),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        (
+            main_paths_without_marker,
+            project_worktree_paths(&project_relinked, cx).1
+        ),
+        (
+            vec![relinked_clone_path.to_path_buf()],
+            vec![relinked_clone_path.to_path_buf()]
+        )
+    );
+}
+
+#[gpui::test]
 async fn test_project_group_key_groups_nested_linked_worktree_under_main_repo(
     executor: gpui::BackgroundExecutor,
     cx: &mut gpui::TestAppContext,
@@ -18210,7 +20301,7 @@ async fn test_conflicted_cherry_pick(cx: &mut gpui::TestAppContext) {
     git_add("a.txt", &repo);
     git_commit("init", &repo);
 
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [root_path], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root_path], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -18366,7 +20457,7 @@ async fn test_rename_work_directory(cx: &mut gpui::TestAppContext) {
     git_commit("init", &repo);
     std::fs::write(root_path.join("projects/project1/a"), "aa").unwrap();
 
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [root_path], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root_path], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -18481,7 +20572,7 @@ async fn test_file_status(cx: &mut gpui::TestAppContext) {
     git_add(DOTGITIGNORE, &repo);
     git_commit("Initial commit", &repo);
 
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [root_path], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root_path], cx).await;
 
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     tree.flush_fs_events(cx).await;
@@ -18764,7 +20855,7 @@ async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     git_add(".gitignore", &repo);
     git_commit("Initial commit", &repo);
 
-    let project = Project::test(Arc::new(RealFs::new(None, cx.executor())), [root_path], cx).await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root_path], cx).await;
     let repository_updates = Arc::new(Mutex::new(Vec::new()));
     let project_events = Arc::new(Mutex::new(Vec::new()));
     project.update(cx, |project, cx| {
@@ -19660,6 +21751,22 @@ async fn test_undo_encoding_change(cx: &mut gpui::TestAppContext) {
         assert_ne!(buffer.text(), "Hi");
         assert!(!buffer.is_dirty());
     });
+
+    let thai = "สวัสดีชาวโลกนี่คือข้อความทดสอบภาษาไทย";
+    fs.insert_file(
+        path!("/dir/test.txt"),
+        thai.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+    )
+    .await;
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), thai);
+    buffer
+        .update(cx, |buffer, cx| {
+            buffer.reload_with_encoding(encoding_rs::UTF_16LE, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), thai);
 }
 
 #[gpui::test]
@@ -19793,7 +21900,7 @@ fn json_lang() -> Arc<Language> {
         LanguageConfig {
             name: "JSON".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["json".to_string()],
+                path_suffixes: vec!["json".into()],
                 ..Default::default()
             })
             .into(),
@@ -19808,7 +21915,7 @@ fn js_lang() -> Arc<Language> {
         LanguageConfig {
             name: "JavaScript".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["js".to_string()],
+                path_suffixes: vec!["js".into()],
                 ..Default::default()
             })
             .into(),
@@ -19857,9 +21964,6 @@ fn python_lang(fs: Arc<FakeFs>) -> Arc<Language> {
         fn meta(&self) -> ToolchainMetadata {
             ToolchainMetadata {
                 term: SharedString::new_static("Virtual Environment"),
-                new_toolchain_placeholder: SharedString::new_static(
-                    "A path to the python3 executable within a virtual environment, or path to virtual environment itself",
-                ),
                 manifest_name: ManifestName::from(SharedString::new_static("pyproject.toml")),
             }
         }
@@ -19877,7 +21981,7 @@ fn python_lang(fs: Arc<FakeFs>) -> Arc<Language> {
             LanguageConfig {
                 name: "Python".into(),
                 matcher: (LanguageMatcher {
-                    path_suffixes: vec!["py".to_string()],
+                    path_suffixes: vec!["py".into()],
                     ..Default::default()
                 })
                 .into(),
@@ -19897,7 +22001,7 @@ fn typescript_lang() -> Arc<Language> {
         LanguageConfig {
             name: "TypeScript".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["ts".to_string()],
+                path_suffixes: vec!["ts".into()],
                 ..Default::default()
             })
             .into(),
@@ -19912,7 +22016,7 @@ fn tsx_lang() -> Arc<Language> {
         LanguageConfig {
             name: "tsx".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["tsx".to_string()],
+                path_suffixes: vec!["tsx".into()],
                 ..Default::default()
             })
             .into(),
@@ -19977,7 +22081,6 @@ fn assert_entry_git_state(
 #[cfg(any())]
 const GIT_STATUS_CONFLICTED: &str = "UU";
 
-#[allow(clippy::disallowed_methods)]
 fn git_cmd(work_dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(work_dir)
@@ -20513,10 +22616,10 @@ async fn test_read_only_files_setting(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.read_only_files = Some(vec![
-                    "**/generated/**".to_string(),
+                settings.project.worktree.read_only_files = Some(SplicingVec::from(vec![
                     "**/*.gen.rs".to_string(),
-                ]);
+                    "**/generated/**".to_string(),
+                ]));
             });
         });
     });
@@ -20582,6 +22685,56 @@ async fn test_read_only_files_setting(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_read_only_files_splice_project_settings(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.read_only_files = Some(SplicingVec::from(vec![
+                    SplicingVec::REST.to_string(),
+                    "**/*.lock".to_string(),
+                ]));
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".zed": {
+                "settings.json": r#"{"read_only_files": ["**/generated/**", "..."]}"#,
+            },
+            "generated": {"schema.rs": ""},
+            "src": {"main.rs": ""},
+            "yarn.lock": "",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    cx.executor().run_until_parked();
+
+    for (relative_path, expected_read_only) in [
+        ("generated/schema.rs", true),
+        ("src/main.rs", false),
+        ("yarn.lock", true),
+    ] {
+        let full_path = Path::new(path!("/root")).join(relative_path);
+        let result = project
+            .update(cx, |project, cx| project.open_local_buffer(&full_path, cx))
+            .await;
+        match result {
+            Ok(buffer) => assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.read_only()),
+                expected_read_only,
+                "{relative_path}"
+            ),
+            Err(error) => panic!("could not open {relative_path}: {error}"),
+        }
+    }
+}
+
+#[gpui::test]
 async fn test_read_only_files_empty_setting(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -20589,7 +22742,7 @@ async fn test_read_only_files_empty_setting(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.read_only_files = Some(vec![]);
+                settings.project.worktree.read_only_files = Some(SplicingVec::from(vec![]));
             });
         });
     });
@@ -20656,12 +22809,7 @@ async fn test_os_read_only_files_open_as_read_only(cx: &mut gpui::TestAppContext
     permissions.set_readonly(true);
     std::fs::set_permissions(&file_path, permissions).unwrap();
 
-    let project = Project::test(
-        Arc::new(RealFs::new(None, cx.executor())),
-        [root.path()],
-        cx,
-    )
-    .await;
+    let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
 
     let buffer = project
         .update(cx, |project, cx| {
@@ -20686,10 +22834,10 @@ async fn test_read_only_files_with_lock_files(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.read_only_files = Some(vec![
+                settings.project.worktree.read_only_files = Some(SplicingVec::from(vec![
                     "**/*.lock".to_string(),
                     "**/package-lock.json".to_string(),
-                ]);
+                ]));
             });
         });
     });
@@ -21300,4 +23448,31 @@ async fn code_action_project(
     cx.executor().run_until_parked();
 
     (project, buffer, handle, fake_servers)
+}
+
+fn alternates(object_dir: &str) -> serde_json::Value {
+    json!({ "info": { "alternates": format!("{object_dir}\n") } })
+}
+
+fn completion_edit_texts(
+    responses: Vec<CompletionResponse>,
+    buffer: &Entity<Buffer>,
+    cx: &TestAppContext,
+) -> Vec<(String, Option<String>)> {
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    let text_for_range = |range: Range<Anchor>| snapshot.text_for_range(range).collect::<String>();
+    responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .map(|completion| {
+            let insert_range = match completion.source {
+                CompletionSource::Lsp { insert_range, .. } => insert_range,
+                _ => None,
+            };
+            (
+                text_for_range(completion.replace_range),
+                insert_range.map(text_for_range),
+            )
+        })
+        .collect()
 }

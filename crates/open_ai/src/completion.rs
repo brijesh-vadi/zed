@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use http_client::StatusCode;
 use language_model_core::{
     CompactedContext, CompactionUpdate, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -11,7 +11,6 @@ use language_model_core::{
     ProviderErrorCategory, Role, StopReason, TokenUsage, provider_name_for_id,
     util::{fix_streamed_json, parse_tool_arguments},
 };
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::responses::{
@@ -33,13 +32,28 @@ const RESPONSE_MESSAGE_PHASE_COMMENTARY: &str = "commentary";
 const RESPONSE_MESSAGE_PHASE_FINAL_ANSWER: &str = "final_answer";
 
 /// Translates the request's `Speed` into the corresponding OpenAI service tier.
-/// Only `Fast` produces a value; `Standard` leaves the field unset so that the
-/// project's default tier applies.
+/// `Standard` leaves the field unset so that the project's default tier applies.
 fn service_tier_for(speed: Option<language_model_core::Speed>) -> Option<ServiceTier> {
     match speed? {
         language_model_core::Speed::Fast => Some(ServiceTier::Priority),
+        language_model_core::Speed::Ultrafast => Some(ServiceTier::Ultrafast),
         language_model_core::Speed::Standard => None,
     }
+}
+
+/// Omitting effort enables reasoning on Sol/Luna/Terra, which then reject temperature.
+fn temperature_for_model(
+    model_id: &str,
+    temperature: Option<f32>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<f32> {
+    temperature.filter(|_| match model_id {
+        "gpt-6-astra" | "gpt-6.1-sol" => false,
+        "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-terra" => {
+            reasoning_effort == Some(ReasoningEffort::None)
+        }
+        _ => true,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +72,7 @@ pub fn into_open_ai(
     reasoning_effort: Option<ReasoningEffort>,
     interleaved_reasoning: bool,
 ) -> Result<crate::Request> {
+    let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
     if request
         .tools
         .iter()
@@ -108,7 +123,9 @@ pub fn into_open_ai(
                         }
                     }
                 }
-                MessageContent::RedactedThinking(_) | MessageContent::Compaction(_) => {}
+                MessageContent::RedactedThinking(_)
+                | MessageContent::Compaction(_)
+                | MessageContent::ReasoningEffort { .. } => {}
                 MessageContent::Image(image) => {
                     add_message_content_part(
                         MessagePart::Image {
@@ -195,7 +212,11 @@ pub fn into_open_ai(
             None
         },
         stop: request.stop,
-        temperature: request.temperature.or(Some(1.0)),
+        temperature: temperature_for_model(
+            model_id,
+            request.temperature.or(Some(1.0)),
+            reasoning_effort,
+        ),
         max_completion_tokens: match max_tokens_parameter {
             ChatCompletionMaxTokensParameter::MaxCompletionTokens => max_output_tokens,
             ChatCompletionMaxTokensParameter::MaxTokens => None,
@@ -210,7 +231,7 @@ pub fn into_open_ai(
             None
         },
         prompt_cache_key: if supports_prompt_cache_key {
-            request.thread_id
+            request.prompt_cache_key.or(request.thread_id)
         } else {
             None
         },
@@ -257,10 +278,12 @@ pub fn into_open_ai_response(
     supports_none_reasoning_effort: bool,
     compaction_state_owner: &LanguageModelProviderId,
 ) -> Result<ResponseRequest> {
+    let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
     let stream = !model_id.starts_with("o1-");
 
     let LanguageModelRequest {
         thread_id,
+        prompt_cache_key,
         prompt_id: _,
         intent: _,
         messages,
@@ -272,6 +295,7 @@ pub fn into_open_ai_response(
         thinking_effort,
         speed,
         compact_at_tokens,
+        max_output_tokens: _,
     } = request;
 
     let service_tier = service_tier_for(speed);
@@ -281,15 +305,11 @@ pub fn into_open_ai_response(
     let mut replayed_reasoning_item_indexes = HashMap::default();
     let mut tool_use_kinds_by_id = HashMap::default();
     let mut system_instructions = Vec::new();
+    let mut in_initial_system_prompt = true;
     for (index, message) in messages.into_iter().enumerate() {
-        // System messages go to the top-level `instructions` field rather
-        // than the input item list. `instructions` is applied per request
-        // (the Responses API documents it as a system message inserted into
-        // the model's context), so the current system prompt survives when
-        // replaying provider compaction state replaces the accumulated input
-        // items below. This also matches the Codex backend, which rejects
-        // system-role input items outright.
-        if message.role == Role::System {
+        // Collect the initial prompt separately so a compaction window cannot
+        // discard it. Later instructions must retain their position.
+        if message.role == Role::System && in_initial_system_prompt {
             for content in message.content {
                 if let MessageContent::Text(text) = content
                     && !text.trim().is_empty()
@@ -298,6 +318,9 @@ pub fn into_open_ai_response(
                 }
             }
             continue;
+        }
+        if !message.contents_empty() {
+            in_initial_system_prompt = false;
         }
         append_message_to_response_items(
             message,
@@ -318,7 +341,7 @@ pub fn into_open_ai_response(
                     name: tool.name,
                     description: Some(tool.description),
                     parameters: Some(input_schema),
-                    strict: None,
+                    strict: Some(false),
                 }
             }
             LanguageModelRequestToolInput::Custom { format } => {
@@ -370,18 +393,26 @@ pub fn into_open_ai_response(
         Vec::new()
     };
 
+    let mut input = crate::responses::ResponseInput::new(provider_items, input_items);
+    if !system_instructions.is_empty() {
+        // Match Codex: the current system prompt precedes even a replayed
+        // compaction window, which is passed through unchanged.
+        input = input.with_leading_item(ResponseInputItem::Message(ResponseMessageItem {
+            role: crate::Role::Developer,
+            content: vec![ResponseInputContent::Text {
+                text: system_instructions.join("\n\n"),
+            }],
+            phase: None,
+        }));
+    }
     Ok(ResponseRequest {
         model: model_id.into(),
-        instructions: if system_instructions.is_empty() {
-            None
-        } else {
-            Some(system_instructions.join("\n\n"))
-        },
-        input: crate::responses::ResponseInput::new(provider_items, input_items),
+        instructions: None,
+        input,
         store: Some(false),
         include,
         stream,
-        temperature,
+        temperature: temperature_for_model(model_id, temperature, reasoning_effort),
         top_p: None,
         max_output_tokens,
         parallel_tool_calls: if tools.is_empty() {
@@ -396,7 +427,7 @@ pub fn into_open_ai_response(
         }),
         tools,
         prompt_cache_key: if supports_prompt_cache_key {
-            thread_id
+            prompt_cache_key.or(thread_id)
         } else {
             None
         },
@@ -463,7 +494,8 @@ fn append_message_to_response_items(
                     provider_items.extend(items);
                 }
             }
-            MessageContent::Compaction(CompactedContext::Summary { .. }) => {}
+            MessageContent::Compaction(CompactedContext::Summary { .. })
+            | MessageContent::ReasoningEffort { .. } => {}
             MessageContent::Image(image) => {
                 push_response_image_part(&role, image, &mut content_parts);
             }
@@ -676,7 +708,7 @@ fn flush_response_parts(
         role: match role {
             Role::User => crate::Role::User,
             Role::Assistant => crate::Role::Assistant,
-            Role::System => crate::Role::System,
+            Role::System => crate::Role::Developer,
         },
         content: parts.clone(),
         phase: match role {
@@ -769,15 +801,15 @@ impl OpenAiResponseEventMapper {
         }
     }
 
-    pub fn map_stream(
+    pub fn map_stream<E: Into<LanguageModelCompletionError> + 'static>(
         mut self,
-        events: Pin<Box<dyn Send + Stream<Item = Result<ResponsesStreamEvent>>>>,
+        events: BoxStream<'static, Result<ResponsesStreamEvent, E>>,
     ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
+                Err(error) => vec![Err(error.into())],
             })
         })
     }
@@ -860,7 +892,8 @@ impl OpenAiResponseEventMapper {
                     events
                 }
             }
-            ResponsesStreamEvent::ReasoningDelta { delta, .. } => {
+            ResponsesStreamEvent::ReasoningDelta { delta, .. }
+            | ResponsesStreamEvent::ReasoningTextDelta { delta, .. } => {
                 if delta.is_empty() {
                     Vec::new()
                 } else {
@@ -879,7 +912,7 @@ impl OpenAiResponseEventMapper {
             }
             ResponsesStreamEvent::RefusalDelta { .. }
             | ResponsesStreamEvent::RefusalDone { .. } => {
-                self.pending_stop_reason = Some(StopReason::Refusal);
+                self.pending_stop_reason = Some(refusal_stop_reason("refusal"));
                 Vec::new()
             }
             ResponsesStreamEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
@@ -972,8 +1005,9 @@ impl OpenAiResponseEventMapper {
                 let mut stop_reason = match reason {
                     Some("max_tokens" | "max_output_tokens") => StopReason::MaxTokens,
                     Some("content_filter") => {
-                        self.pending_stop_reason = Some(StopReason::Refusal);
-                        StopReason::Refusal
+                        let refusal = refusal_stop_reason("content_filter");
+                        self.pending_stop_reason = Some(refusal.clone());
+                        refusal
                     }
                     _ => self
                         .pending_stop_reason
@@ -986,8 +1020,10 @@ impl OpenAiResponseEventMapper {
                 if response_output_contains_refusal(&response.output)
                     && !matches!(stop_reason, StopReason::MaxTokens)
                 {
-                    self.pending_stop_reason = Some(StopReason::Refusal);
-                    stop_reason = StopReason::Refusal;
+                    if !stop_reason.is_refusal() {
+                        stop_reason = refusal_stop_reason("refusal");
+                    }
+                    self.pending_stop_reason = Some(stop_reason.clone());
                 }
                 if self.pending_stop_reason.is_none() {
                     events.extend(self.emit_tool_calls_from_output(&response.output));
@@ -1064,6 +1100,7 @@ impl OpenAiResponseEventMapper {
             | ResponsesStreamEvent::ContentPartAdded { .. }
             | ResponsesStreamEvent::ContentPartDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryTextDone { .. }
+            | ResponsesStreamEvent::ReasoningTextDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryPartDone { .. }
             | ResponsesStreamEvent::ReasoningDone { .. }
             | ResponsesStreamEvent::Created { .. }
@@ -1113,7 +1150,7 @@ impl OpenAiResponseEventMapper {
         events.extend(self.capture_reasoning_items_from_output(&response.output));
 
         if response_output_contains_refusal(&response.output) {
-            self.pending_stop_reason = Some(StopReason::Refusal);
+            self.pending_stop_reason = Some(refusal_stop_reason("refusal"));
         }
 
         if self.pending_stop_reason.is_none() {
@@ -1157,8 +1194,8 @@ impl OpenAiResponseEventMapper {
                         Ok(input) => {
                             events.push(Ok(LanguageModelCompletionEvent::ToolUse(
                                 LanguageModelToolUse {
-                                    id: LanguageModelToolUseId::from(call_id.clone()),
-                                    name: name.clone(),
+                                    id: LanguageModelToolUseId::from(call_id),
+                                    name,
                                     is_input_complete: true,
                                     input: LanguageModelToolUseInput::Json(input),
                                     raw_input: arguments.clone(),
@@ -1168,8 +1205,8 @@ impl OpenAiResponseEventMapper {
                         }
                         Err(error) => {
                             events.push(Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
-                                id: LanguageModelToolUseId::from(call_id.clone()),
-                                tool_name: name.clone(),
+                                id: LanguageModelToolUseId::from(call_id),
+                                tool_name: name,
                                 raw_input: Arc::<str>::from(arguments.clone()),
                                 json_parse_error: error.to_string(),
                             }));
@@ -1356,11 +1393,16 @@ fn completion_error_from_response_error(
     error: &ResponseError,
     provider: language_model_core::LanguageModelProviderName,
 ) -> LanguageModelCompletionError {
-    let category = response_error_category(error.code.as_deref(), None, &error.message);
+    let category = response_error_category(
+        error.code.as_deref(),
+        error.error_type.as_deref(),
+        None,
+        &error.message,
+    );
     LanguageModelCompletionError::from_provider_response(
         provider,
         None,
-        error.code.clone(),
+        error.code.clone().or_else(|| error.error_type.clone()),
         error.message.clone(),
         None,
         category,
@@ -1369,41 +1411,52 @@ fn completion_error_from_response_error(
 
 pub(crate) fn response_error_category(
     code: Option<&str>,
+    error_type: Option<&str>,
     status: Option<StatusCode>,
     message: &str,
 ) -> ProviderErrorCategory {
-    match code {
-        Some("context_length_exceeded" | "request_too_large") => {
+    code.and_then(response_error_category_from_discriminator)
+        .or_else(|| error_type.and_then(response_error_category_from_discriminator))
+        .unwrap_or_else(|| {
+            status
+                .map(|status| ProviderErrorCategory::from_http_status(status, message))
+                .unwrap_or(ProviderErrorCategory::Other)
+        })
+}
+
+fn response_error_category_from_discriminator(
+    discriminator: &str,
+) -> Option<ProviderErrorCategory> {
+    let category = match discriminator {
+        "context_length_exceeded" | "request_too_large" => {
             ProviderErrorCategory::PromptTooLarge { tokens: None }
         }
-        Some("invalid_encrypted_content") => ProviderErrorCategory::InvalidEncryptedContent,
-        Some("invalid_request_error") => ProviderErrorCategory::InvalidRequest,
-        Some("authentication_error") => ProviderErrorCategory::Authentication,
-        Some(
-            "billing_error"
-            | "payment_required_error"
-            | "credit_balance_exhausted"
-            | "insufficient_quota"
-            | "organization_spend_limit_exceeded"
-            | "project_spend_limit_exceeded"
-            | "organization_usage_limit_exceeded",
-        ) => ProviderErrorCategory::PaymentRequired,
-        Some("permission_error") => ProviderErrorCategory::Permission,
-        Some("cyber_policy" | "invalid_prompt") => ProviderErrorCategory::ContentPolicy,
-        Some("not_found_error") => ProviderErrorCategory::EndpointNotFound,
-        Some("conflict_error") => ProviderErrorCategory::Conflict,
-        Some("rate_limit_error" | "rate_limit_exceeded") => ProviderErrorCategory::RateLimit,
-        Some("timeout_error" | "request_timed_out") => ProviderErrorCategory::Timeout,
-        Some("api_error" | "internal_server_error" | "server_error") => {
+        "invalid_encrypted_content" => ProviderErrorCategory::InvalidEncryptedContent,
+        "invalid_request_error" => ProviderErrorCategory::InvalidRequest,
+        "authentication_error" => ProviderErrorCategory::Authentication,
+        "billing_error"
+        | "payment_required_error"
+        | "credit_balance_exhausted"
+        | "insufficient_quota"
+        | "organization_spend_limit_exceeded"
+        | "project_spend_limit_exceeded"
+        | "organization_usage_limit_exceeded"
+        | "usage_limit_reached" => ProviderErrorCategory::PaymentRequired,
+        "permission_error" => ProviderErrorCategory::Permission,
+        "cyber_policy" | "invalid_prompt" => ProviderErrorCategory::ContentPolicy,
+        "not_found_error" => ProviderErrorCategory::EndpointNotFound,
+        "conflict_error" => ProviderErrorCategory::Conflict,
+        "rate_limit_error" | "rate_limit_exceeded" => ProviderErrorCategory::RateLimit,
+        "timeout_error" | "request_timed_out" => ProviderErrorCategory::Timeout,
+        "api_error" | "internal_server_error" | "server_error" => {
             ProviderErrorCategory::InternalServer
         }
-        Some("overloaded_error" | "server_is_overloaded" | "slow_down") => {
+        "overloaded_error" | "server_is_overloaded" | "slow_down" => {
             ProviderErrorCategory::Overloaded
         }
-        Some(_) | None => status
-            .map(|status| ProviderErrorCategory::from_http_status(status, message))
-            .unwrap_or(ProviderErrorCategory::Other),
-    }
+        _ => return None,
+    };
+    Some(category)
 }
 
 fn response_error_message(error: &ResponseError) -> String {
@@ -1416,6 +1469,14 @@ fn response_error_message(error: &ResponseError) -> String {
         (None, false) => message.to_string(),
         (None, true) => "response error".to_string(),
     }
+}
+
+fn refusal_stop_reason(reason: &str) -> StopReason {
+    StopReason::Refusal(Some(language_model_core::RefusalDetails {
+        reason: reason.into(),
+        categories: Vec::new(),
+        stage: Some(language_model_core::RefusalStage::Output),
+    }))
 }
 
 fn response_output_contains_refusal(output: &[ResponseOutputItem]) -> bool {
@@ -1473,7 +1534,12 @@ fn response_reasoning_input_item_from_output(
     ResponseReasoningInputItem {
         id: reasoning.id.clone(),
         summary,
-        content: reasoning.content.clone(),
+        content: reasoning
+            .content
+            .iter()
+            .filter(|part| !matches!(part, crate::responses::ReasoningContentPart::Other))
+            .cloned()
+            .collect(),
         encrypted_content,
         status: reasoning.status.clone(),
     }
@@ -1500,10 +1566,57 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn prompt_cache_key_respects_override_fallback_and_capability() -> Result<()> {
+        for (explicit, thread, supported, expected) in [
+            (Some("cache"), Some("thread"), true, Some("cache")),
+            (Some("cache"), None, true, Some("cache")),
+            (None, Some("thread"), true, Some("thread")),
+            (None, None, true, None),
+            (Some("cache"), Some("thread"), false, None),
+            (None, Some("thread"), false, None),
+        ] {
+            let request = LanguageModelRequest {
+                thread_id: thread.map(str::to_owned),
+                prompt_cache_key: explicit.map(str::to_owned),
+                ..Default::default()
+            };
+            let chat = into_open_ai(
+                request.clone(),
+                "gpt-5",
+                true,
+                supported,
+                None,
+                ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                None,
+                false,
+            )?;
+            let response = into_open_ai_response(
+                request,
+                "gpt-5",
+                true,
+                supported,
+                None,
+                None,
+                false,
+                &OPEN_AI_PROVIDER_ID,
+            )?;
+            assert_eq!(chat.prompt_cache_key.as_deref(), expected);
+            assert_eq!(response.prompt_cache_key.as_deref(), expected);
+            assert_eq!(
+                response.into_compact_request().prompt_cache_key.as_deref(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
     fn map_response_events(events: Vec<ResponsesStreamEvent>) -> Vec<LanguageModelCompletionEvent> {
         block_on(async {
             OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID)
-                .map_stream(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+                .map_stream(Box::pin(futures::stream::iter(
+                    events.into_iter().map(Ok::<_, crate::RequestError>),
+                )))
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
@@ -1771,6 +1884,7 @@ mod tests {
 
         let request = LanguageModelRequest {
             thread_id: Some("thread-123".into()),
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![
@@ -1818,6 +1932,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -1835,8 +1950,12 @@ mod tests {
         let serialized = serde_json::to_value(&response).unwrap();
         let expected = json!({
             "model": "custom-model",
-            "instructions": "System context",
             "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": "System context" }]
+                },
                 {
                     "type": "message",
                     "role": "user",
@@ -1875,7 +1994,8 @@ mod tests {
                     "type": "function",
                     "name": "get_weather",
                     "description": "Fetches the weather",
-                    "parameters": { "type": "object" }
+                    "parameters": { "type": "object" },
+                    "strict": false
                 }
             ],
             "prompt_cache_key": "thread-123",
@@ -1976,6 +2096,7 @@ mod tests {
 
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2004,6 +2125,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2069,6 +2191,7 @@ mod tests {
 
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2105,6 +2228,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2160,6 +2284,7 @@ mod tests {
     fn into_open_ai_response_replays_reasoning_without_encrypted_content() {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2190,6 +2315,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2240,6 +2366,7 @@ mod tests {
     fn into_open_ai_response_omits_reasoning_when_thinking_is_disabled_and_none_is_unsupported() {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2256,6 +2383,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2274,18 +2402,83 @@ mod tests {
         assert_eq!(serialized.get("reasoning"), None);
     }
 
-    /// `Speed::Fast` should translate to `service_tier: "priority"` on the
-    /// outgoing Responses request, while `Standard` / `None` should leave the
-    /// field unset so the project's default tier wins.
     #[test]
-    fn into_open_ai_response_sets_service_tier_for_fast_speed() -> Result<()> {
+    fn request_conversion_omits_unsupported_temperature() -> Result<()> {
+        use ReasoningEffort::{Medium, None as NoReasoning};
+
+        for (model_id, temperature, effort, expected_temperature) in [
+            ("gpt-6.1-sol", Some(0.25), None, None),
+            ("gpt-6.1-sol", None, None, None),
+            ("gpt-6.1-terra", Some(0.25), None, None),
+            ("gpt-6.1-terra", Some(0.25), Some(Medium), None),
+            ("gpt-6.1-terra", Some(0.25), Some(NoReasoning), Some(0.25)),
+            ("gpt-6-astra", Some(0.25), None, None),
+            ("gpt-6-astra", None, None, None),
+            ("gpt-6-sol", Some(0.25), None, None),
+            ("gpt-6-sol", Some(0.25), Some(Medium), None),
+            ("gpt-6-sol", Some(0.25), Some(NoReasoning), Some(0.25)),
+            ("gpt-6-luna", Some(0.25), None, None),
+            ("gpt-6-luna", Some(0.25), Some(Medium), None),
+            ("gpt-6-luna", Some(0.25), Some(NoReasoning), Some(0.25)),
+            ("gpt-4o-mini", Some(0.25), None, Some(0.25)),
+            ("custom-model", Some(0.25), None, Some(0.25)),
+        ] {
+            let request = LanguageModelRequest {
+                temperature,
+                thinking_allowed: effort != Some(NoReasoning),
+                ..Default::default()
+            };
+            let response = into_open_ai_response(
+                request.clone(),
+                model_id,
+                true,
+                true,
+                None,
+                effort,
+                effort == Some(NoReasoning),
+                &OPEN_AI_PROVIDER_ID,
+            )?;
+            let chat = into_open_ai(
+                request,
+                model_id,
+                true,
+                true,
+                None,
+                ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                effort,
+                false,
+            )?;
+            assert_eq!(
+                response.reasoning.as_ref().map(|config| config.effort),
+                effort
+            );
+            assert_eq!(chat.reasoning_effort, effort);
+
+            for (endpoint, serialized) in [
+                ("responses", serde_json::to_value(response)?),
+                ("chat/completions", serde_json::to_value(chat)?),
+            ] {
+                assert_eq!(
+                    serialized.get("temperature"),
+                    expected_temperature.map(serde_json::Value::from).as_ref(),
+                    "{endpoint} temperature for {model_id} with {temperature:?}, {effort:?}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn into_open_ai_response_sets_service_tier_for_speed() -> Result<()> {
         for (speed, expected) in [
             (None, None),
             (Some(Speed::Standard), None),
             (Some(Speed::Fast), Some("priority")),
+            (Some(Speed::Ultrafast), Some("ultrafast")),
         ] {
             let request = LanguageModelRequest {
                 thread_id: None,
+                prompt_cache_key: None,
                 prompt_id: None,
                 intent: None,
                 messages: vec![LanguageModelRequestMessage {
@@ -2302,6 +2495,7 @@ mod tests {
                 thinking_effort: None,
                 speed,
                 compact_at_tokens: None,
+                max_output_tokens: None,
             };
 
             let response = into_open_ai_response(
@@ -2338,6 +2532,7 @@ mod tests {
         ] {
             let request = LanguageModelRequest {
                 thread_id: None,
+                prompt_cache_key: None,
                 prompt_id: None,
                 intent: None,
                 messages: vec![LanguageModelRequestMessage {
@@ -2354,6 +2549,7 @@ mod tests {
                 thinking_effort: None,
                 speed,
                 compact_at_tokens: None,
+                max_output_tokens: None,
             };
 
             let chat = into_open_ai(
@@ -2383,6 +2579,7 @@ mod tests {
     fn into_open_ai_can_send_max_tokens_parameter() -> Result<()> {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2399,22 +2596,60 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
-        let chat = into_open_ai(
-            request,
-            "compatible-model",
-            false,
-            false,
-            Some(4096),
-            ChatCompletionMaxTokensParameter::MaxTokens,
-            None,
-            false,
-        )?;
+        for (requested, model_maximum, expected) in [
+            (None, None, None),
+            (None, Some(4096), Some(4096)),
+            (Some(1024), Some(4096), Some(1024)),
+            (Some(8192), Some(4096), Some(4096)),
+            (Some(1024), None, Some(1024)),
+        ] {
+            let mut request = request.clone();
+            request.max_output_tokens = requested;
+            for (parameter, field, absent_field) in [
+                (
+                    ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                    "max_completion_tokens",
+                    "max_tokens",
+                ),
+                (
+                    ChatCompletionMaxTokensParameter::MaxTokens,
+                    "max_tokens",
+                    "max_completion_tokens",
+                ),
+            ] {
+                let chat = into_open_ai(
+                    request.clone(),
+                    "compatible-model",
+                    false,
+                    false,
+                    model_maximum,
+                    parameter,
+                    None,
+                    false,
+                )?;
+                let serialized = serde_json::to_value(chat)?;
+                assert_eq!(serialized[field].as_u64(), expected);
+                assert!(serialized.get(absent_field).is_none());
+            }
 
-        let serialized = serde_json::to_value(&chat)?;
-        assert_eq!(serialized.get("max_completion_tokens"), None);
-        assert_eq!(serialized["max_tokens"], json!(4096));
+            let response = into_open_ai_response(
+                request,
+                "gpt-4.1",
+                false,
+                false,
+                model_maximum,
+                None,
+                false,
+                &language_model_core::OPEN_AI_PROVIDER_ID,
+            )?;
+            assert_eq!(
+                serde_json::to_value(response)?["max_output_tokens"].as_u64(),
+                expected
+            );
+        }
         Ok(())
     }
 
@@ -2422,6 +2657,7 @@ mod tests {
     fn into_open_ai_response_sends_none_reasoning_when_thinking_is_disabled() -> Result<()> {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2438,6 +2674,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2463,6 +2700,7 @@ mod tests {
     fn into_open_ai_response_uses_default_effort_when_selected_effort_is_none() -> Result<()> {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2479,6 +2717,7 @@ mod tests {
             thinking_effort: Some("none".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2506,6 +2745,7 @@ mod tests {
     fn into_open_ai_response_replays_assistant_phase() {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2532,6 +2772,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2600,6 +2841,7 @@ mod tests {
         });
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![
@@ -2624,6 +2866,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2678,6 +2921,7 @@ mod tests {
     fn into_open_ai_response_replays_reasoning_details_but_not_thinking_text() {
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![LanguageModelRequestMessage {
@@ -2714,6 +2958,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2855,6 +3100,7 @@ mod tests {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
                     code: Some("server_error".into()),
+                    error_type: None,
                     message: "The model failed to generate a response.".into(),
                     param: None,
                 }),
@@ -2948,6 +3194,35 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_preserves_and_classifies_type_without_code() {
+        let event = serde_json::from_value::<ResponsesStreamEvent>(json!({
+            "type": "error",
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "plus"
+            }
+        }))
+        .expect("nested usage limit error event");
+
+        let mut mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID);
+        let mapped = mapper.map_event(event);
+
+        assert_eq!(mapped.len(), 1);
+        let error = mapped.into_iter().next().unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                code: Some(code),
+                message,
+                category: ProviderErrorCategory::PaymentRequired,
+                ..
+            } if code == "usage_limit_reached"
+                && message == "The usage limit has been reached"
+        ));
+    }
+
+    #[test]
     fn responses_stream_maps_billing_codes_to_payment_required() {
         for code in [
             "billing_error",
@@ -2959,7 +3234,7 @@ mod tests {
             "organization_usage_limit_exceeded",
         ] {
             assert_eq!(
-                response_error_category(Some(code), None, ""),
+                response_error_category(Some(code), None, None, ""),
                 ProviderErrorCategory::PaymentRequired,
                 "{code}"
             );
@@ -2967,9 +3242,22 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_uses_known_type_when_code_is_unknown() {
+        assert_eq!(
+            response_error_category(
+                Some("provider_specific_code"),
+                Some("usage_limit_reached"),
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                "",
+            ),
+            ProviderErrorCategory::PaymentRequired
+        );
+    }
+
+    #[test]
     fn responses_stream_maps_invalid_prompt_to_content_policy() {
         assert_eq!(
-            response_error_category(Some("invalid_prompt"), None, ""),
+            response_error_category(Some("invalid_prompt"), None, None, ""),
             ProviderErrorCategory::ContentPolicy
         );
     }
@@ -2978,7 +3266,7 @@ mod tests {
     fn responses_stream_maps_overload_codes_to_overloaded() {
         for code in ["overloaded_error", "server_is_overloaded", "slow_down"] {
             assert_eq!(
-                response_error_category(Some(code), None, ""),
+                response_error_category(Some(code), None, None, ""),
                 ProviderErrorCategory::Overloaded,
                 "{code}"
             );
@@ -3021,6 +3309,7 @@ mod tests {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
                     code: Some("context_length_exceeded".into()),
+                    error_type: None,
                     message: "Your input exceeds the context window of this model.".into(),
                     param: Some("input".into()),
                 }),
@@ -3101,9 +3390,34 @@ mod tests {
 
         assert_eq!(mapped.len(), 1);
         assert!(matches!(
-            mapped[0],
-            LanguageModelCompletionEvent::Stop(StopReason::Refusal)
+            &mapped[0],
+            LanguageModelCompletionEvent::Stop(StopReason::Refusal(Some(details)))
+                if details.reason == "refusal" && details.categories.is_empty()
         ));
+    }
+
+    #[test]
+    fn responses_content_filter_preserves_structured_reason() {
+        let mapped = map_response_events(vec![
+            serde_json::from_value(json!({
+                "type": "response.incomplete",
+                "response": {
+                    "incomplete_details": {"reason": "content_filter"},
+                    "output": [{"type":"message","content":[{"type":"refusal","refusal":"Declined"}]}]
+                }
+            }))
+            .unwrap(),
+        ]);
+        assert_eq!(
+            mapped,
+            vec![LanguageModelCompletionEvent::Stop(StopReason::Refusal(
+                Some(language_model_core::RefusalDetails {
+                    reason: "content_filter".into(),
+                    categories: Vec::new(),
+                    stage: Some(language_model_core::RefusalStage::Output),
+                })
+            )),]
+        );
     }
 
     #[test]
@@ -3127,7 +3441,7 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert!(matches!(
             mapped[0],
-            LanguageModelCompletionEvent::Stop(StopReason::Refusal)
+            LanguageModelCompletionEvent::Stop(StopReason::Refusal(_))
         ));
     }
 
@@ -3675,10 +3989,9 @@ mod tests {
             Some("ENC"),
             Some("completed".into()),
         );
-        reasoning_item.content = vec![json!({
-            "type": "reasoning_text",
-            "text": "Internal reasoning text."
-        })];
+        reasoning_item.content = vec![crate::responses::ReasoningContentPart::ReasoningText {
+            text: "Internal reasoning text.".into(),
+        }];
 
         let events = vec![
             ResponsesStreamEvent::OutputItemDone {
@@ -3933,6 +4246,7 @@ mod tests {
         };
         let request = LanguageModelRequest {
             thread_id: None,
+            prompt_cache_key: None,
             prompt_id: None,
             intent: None,
             messages: vec![
@@ -3974,6 +4288,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let result = into_open_ai(
@@ -4112,18 +4427,24 @@ mod tests {
     fn open_ai_response_converts_to_compact_request_with_supported_controls() {
         let request = LanguageModelRequest {
             thread_id: Some("thread-123".to_string()),
-            messages: vec![LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text("Retain this context.".into())],
+            messages: [
+                (Role::System, "Preserve implementation details."),
+                (Role::User, "Retain this context."),
+            ]
+            .into_iter()
+            .map(|(role, text)| LanguageModelRequestMessage {
+                role,
+                content: vec![MessageContent::Text(text.into())],
                 cache: false,
                 reasoning_details: None,
-            }],
+            })
+            .collect(),
             speed: Some(Speed::Fast),
             compact_at_tokens: Some(100_000),
             ..Default::default()
         };
 
-        let mut response_request = into_open_ai_response(
+        let compact_request = into_open_ai_response(
             request,
             "gpt-5.4",
             true,
@@ -4133,23 +4454,25 @@ mod tests {
             false,
             &OPEN_AI_PROVIDER_ID,
         )
-        .unwrap();
-        response_request.instructions = Some("Preserve implementation details.".to_string());
-        let compact_request = response_request.into_compact_request();
+        .unwrap()
+        .into_compact_request();
 
         assert_eq!(
             serde_json::to_value(compact_request).unwrap(),
             json!({
                 "model": "gpt-5.4",
-                "instructions": "Preserve implementation details.",
-                "input": [{
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": "Retain this context."
-                    }]
-                }],
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "Preserve implementation details."}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Retain this context."}]
+                    }
+                ],
                 "prompt_cache_key": "thread-123",
                 "service_tier": "priority"
             })
@@ -4275,7 +4598,7 @@ mod tests {
     }
 
     #[test]
-    fn into_open_ai_response_hoists_system_messages_into_instructions() {
+    fn into_open_ai_response_keeps_system_updates_as_developer_items() {
         let request = LanguageModelRequest {
             messages: vec![
                 LanguageModelRequestMessage {
@@ -4313,31 +4636,38 @@ mod tests {
         .unwrap();
 
         let serialized = serde_json::to_value(&response).unwrap();
-        assert_eq!(
-            serialized["instructions"],
-            json!("You are a coding assistant.\n\nPrefer terse answers.")
-        );
+        assert!(serialized.get("instructions").is_none());
         assert_eq!(
             serialized["input"],
             json!([
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        { "type": "input_text", "text": "You are a coding assistant." }
+                    ]
+                },
                 {
                     "type": "message",
                     "role": "user",
                     "content": [
                         { "type": "input_text", "text": "Hello." }
                     ]
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        { "type": "input_text", "text": "Prefer terse answers." }
+                    ]
                 }
             ])
         );
     }
 
-    /// Replaying provider compaction state discards all input items
-    /// accumulated before it, but the system prompt must not be lost with
-    /// them: it lives in the per-request `instructions` field, outside the
-    /// compacted window, so the model keeps running on the current prompt
-    /// rather than whatever was frozen into the window at compaction time.
+    /// Replaying provider compaction state must not discard the current system prompt.
     #[test]
-    fn into_open_ai_response_preserves_system_prompt_across_compaction_replay() {
+    fn into_open_ai_response_prepends_system_prompt_to_compaction_replay() {
         let state = provider_compaction_state_from_items(
             OPEN_AI_PROVIDER_ID,
             vec![json!({
@@ -4375,6 +4705,14 @@ mod tests {
                     cache: false,
                     reasoning_details: None,
                 },
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text(
+                        "Use the updated project context.".into(),
+                    )],
+                    cache: false,
+                    reasoning_details: None,
+                },
             ],
             ..Default::default()
         };
@@ -4392,10 +4730,17 @@ mod tests {
         .unwrap();
 
         let serialized = serde_json::to_value(&response).unwrap();
-        assert_eq!(serialized["instructions"], json!("Current system prompt."));
+        assert!(serialized.get("instructions").is_none());
         assert_eq!(
             serialized["input"],
             json!([
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        { "type": "input_text", "text": "Current system prompt." }
+                    ]
+                },
                 {
                     "type": "compaction",
                     "id": "cmp_1",
@@ -4406,6 +4751,13 @@ mod tests {
                     "role": "user",
                     "content": [
                         { "type": "input_text", "text": "Continue." }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        { "type": "input_text", "text": "Use the updated project context." }
                     ]
                 }
             ])

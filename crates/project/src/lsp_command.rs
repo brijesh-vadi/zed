@@ -1,11 +1,11 @@
 pub mod signature_help;
 
 use crate::{
-    CodeAction, CompletionSource, CoreCompletion, CoreCompletionResponse, DocumentColor,
-    DocumentHighlight, DocumentSymbol, Hover, HoverBlock, HoverBlockKind, InlayHint,
-    InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTooltip, Location,
-    LocationLink, LspAction, LspPullDiagnostics, MarkupContent, PrepareRenameResponse, ProjectPath,
-    ProjectTransaction, PulledDiagnostics, ResolveState,
+    CodeAction, CompletionResponse, CompletionSource, CoreCompletion, CoreCompletionResponse,
+    DocumentColor, DocumentHighlight, DocumentSymbol, Hover, HoverBlock, HoverBlockKind, InlayHint,
+    InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTextEdits,
+    InlayHintTooltip, Location, LocationLink, LspAction, LspPullDiagnostics, MarkupContent,
+    PrepareRenameResponse, ProjectPath, ProjectTransaction, PulledDiagnostics, ResolveState,
     lsp_store::{LanguageServerToQuery, LocalLspStore, LspDocumentLink, LspFoldingRange, LspStore},
 };
 use anyhow::{Context as _, Result};
@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use client::proto::{self, PeerId};
 use clock::Global;
 use collections::HashMap;
-use futures::future;
 use gpui::{App, AsyncApp, Entity, SharedString, Task, TaskExt, prelude::FluentBuilder};
 use language::{
     Anchor, Bias, Buffer, BufferSnapshot, CachedLspAdapter, CharKind, CharScopeContext,
@@ -232,7 +231,7 @@ pub(crate) struct GetHover {
 
 #[derive(Debug)]
 pub(crate) struct GetCompletions {
-    pub position: PointUtf16,
+    pub position: Anchor,
     pub context: CompletionContext,
     pub server_id: Option<lsp::LanguageServerId>,
 }
@@ -3158,6 +3157,92 @@ impl GetCompletions {
     }
 }
 
+pub(crate) struct RequestedCompletionToken {
+    position: Anchor,
+    version: Global,
+    prefix: Range<Anchor>,
+    separator: Anchor,
+}
+
+impl RequestedCompletionToken {
+    pub(crate) fn new(position: Anchor, snapshot: &BufferSnapshot) -> Self {
+        let offset = position.to_offset(snapshot);
+        let token_start = completion_token_range(snapshot, offset).start;
+        let prefix_end = snapshot.anchor_before(offset);
+        let prefix_start = if token_start < offset {
+            snapshot.anchor_after(token_start)
+        } else {
+            prefix_end
+        };
+        Self {
+            position,
+            version: snapshot.version().clone(),
+            prefix: prefix_start..prefix_end,
+            separator: snapshot.anchor_before(token_start),
+        }
+    }
+
+    pub(crate) fn retain_valid_completions(
+        &self,
+        responses: &mut [CompletionResponse],
+        snapshot: &BufferSnapshot,
+    ) {
+        if snapshot.version() == &self.version {
+            return;
+        }
+        let ranges = self.fallback_ranges(snapshot);
+        for response in responses {
+            let completions_count = response.completions.len();
+            response.completions.retain_mut(|completion| {
+                let CompletionSource::Lsp {
+                    insert_range,
+                    lsp_completion,
+                    lsp_defaults,
+                    ..
+                } = &mut completion.source
+                else {
+                    return true;
+                };
+                if completion_text_edit(lsp_completion, lsp_defaults.as_deref()).is_some() {
+                    return true;
+                }
+                let Some((replace_range, fallback_insert_range)) = ranges.clone() else {
+                    return false;
+                };
+                *insert_range = Some(fallback_insert_range);
+                completion.replace_range = replace_range;
+                true
+            });
+            if response.completions.len() != completions_count {
+                response.is_incomplete = true;
+            }
+        }
+    }
+
+    fn fallback_ranges(&self, snapshot: &BufferSnapshot) -> Option<(Range<Anchor>, Range<Anchor>)> {
+        let offset = self.position.to_offset(snapshot);
+        let prefix_start = self.prefix.start.to_offset(snapshot);
+        let separator_kept = self.separator.is_valid(snapshot);
+        let prefix_kept =
+            self.prefix.start.is_valid(snapshot) || self.prefix.end.is_valid(snapshot);
+        let classifier = snapshot
+            .char_classifier_at(offset)
+            .scope_context(Some(CharScopeContext::Completion));
+        let prefix_is_word = snapshot
+            .chars_for_range(prefix_start..offset)
+            .all(|character| classifier.is_word(character));
+        let token = completion_token_range(snapshot, offset);
+        let joined_across_deleted_separator = token.start < prefix_start && !separator_kept;
+        (prefix_kept && prefix_is_word && !joined_across_deleted_separator).then(|| {
+            let start = snapshot.anchor_before(token.start.min(prefix_start));
+            (
+                start..snapshot.anchor_after(token.end),
+                start..self.position,
+            )
+        })
+    }
+}
+
 #[async_trait(?Send)]
 impl LspCommand for GetCompletions {
     type Response = CoreCompletionResponse;
@@ -3178,12 +3263,13 @@ impl LspCommand for GetCompletions {
     fn to_lsp(
         &self,
         path: &Path,
-        _: &Buffer,
+        buffer: &Buffer,
         _: &Arc<LanguageServer>,
         _: &App,
     ) -> Result<lsp::CompletionParams> {
+        let position = self.position.to_point_utf16(&buffer.snapshot());
         Ok(lsp::CompletionParams {
-            text_document_position: make_lsp_text_document_position(path, self.position)?,
+            text_document_position: make_lsp_text_document_position(path, position)?,
             context: Some(self.context.clone()),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -3229,36 +3315,10 @@ impl LspCommand for GetCompletions {
         let mut completion_edits = Vec::new();
         buffer.update(&mut cx, |buffer, _cx| {
             let snapshot = buffer.snapshot();
-            let clipped_position = buffer.clip_point_utf16(Unclipped(self.position), Bias::Left);
 
             let mut range_for_token = None;
             completions.retain(|lsp_completion| {
-                let lsp_edit = lsp_completion.text_edit.clone().or_else(|| {
-                    let default_text_edit = lsp_defaults.as_deref()?.edit_range.as_ref()?;
-                    let new_text = lsp_completion
-                        .text_edit_text
-                        .as_ref()
-                        .unwrap_or(&lsp_completion.label)
-                        .clone();
-                    match default_text_edit {
-                        CompletionListItemDefaultsEditRange::Range(range) => {
-                            Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                                range: *range,
-                                new_text,
-                            }))
-                        }
-                        CompletionListItemDefaultsEditRange::InsertAndReplace {
-                            insert,
-                            replace,
-                        } => Some(lsp::CompletionTextEdit::InsertAndReplace(
-                            lsp::InsertReplaceEdit {
-                                new_text,
-                                insert: *insert,
-                                replace: *replace,
-                            },
-                        )),
-                    }
-                });
+                let lsp_edit = completion_text_edit(lsp_completion, lsp_defaults.as_deref());
 
                 let edit = match lsp_edit {
                     // If the language server provides a range to overwrite, then
@@ -3272,50 +3332,16 @@ impl LspCommand for GetCompletions {
                     // If the language server does not provide a range, then infer
                     // the range based on the syntax tree.
                     None => {
-                        if self.position != clipped_position {
-                            log::info!("completion out of expected range ");
-                            return false;
-                        }
-
-                        let default_edit_range = lsp_defaults.as_ref().and_then(|lsp_defaults| {
-                            lsp_defaults
-                                .edit_range
-                                .as_ref()
-                                .and_then(|range| match range {
-                                    CompletionListItemDefaultsEditRange::Range(r) => Some(r),
-                                    _ => None,
-                                })
-                        });
-
-                        let range = if let Some(range) = default_edit_range {
-                            let range = range_from_lsp(*range);
-                            let start = snapshot.clip_point_utf16(range.start, Bias::Left);
-                            let end = snapshot.clip_point_utf16(range.end, Bias::Left);
-                            if start != range.start.0 || end != range.end.0 {
-                                log::info!("completion out of expected range");
-                                return false;
-                            }
-
-                            snapshot.anchor_before(start)..snapshot.anchor_after(end)
-                        } else {
-                            range_for_token
-                                .get_or_insert_with(|| {
-                                    let offset = self.position.to_offset(&snapshot);
-                                    let (range, kind) = snapshot.surrounding_word(
-                                        offset,
-                                        Some(CharScopeContext::Completion),
-                                    );
-                                    let range = if kind == Some(CharKind::Word) {
-                                        range
-                                    } else {
-                                        offset..offset
-                                    };
-
-                                    snapshot.anchor_before(range.start)
-                                        ..snapshot.anchor_after(range.end)
-                                })
-                                .clone()
-                        };
+                        let range = range_for_token
+                            .get_or_insert_with(|| {
+                                let range = completion_token_range(
+                                    &snapshot,
+                                    self.position.to_offset(&snapshot),
+                                );
+                                snapshot.anchor_before(range.start)
+                                    ..snapshot.anchor_after(range.end)
+                            })
+                            .clone();
 
                         // We already know text_edit is None here
                         let text = lsp_completion
@@ -3324,9 +3350,10 @@ impl LspCommand for GetCompletions {
                             .unwrap_or(&lsp_completion.label)
                             .clone();
 
+                        let insert_range = Some(range.start..self.position);
                         ParsedCompletionEdit {
                             replace_range: range,
-                            insert_range: None,
+                            insert_range,
                             new_text: text,
                         }
                     }
@@ -3382,13 +3409,17 @@ impl LspCommand for GetCompletions {
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetCompletions {
-        let anchor = buffer.anchor_after(self.position);
         proto::GetCompletions {
             project_id,
             buffer_id: buffer.remote_id().into(),
-            position: Some(language::proto::serialize_anchor(&anchor)),
+            position: Some(language::proto::serialize_anchor(&self.position)),
             version: serialize_version(&buffer.version()),
             server_id: self.server_id.map(|id| id.to_proto()),
+            trigger_character: self
+                .context
+                .trigger_character
+                .clone()
+                .filter(|_| self.context.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER),
         }
     }
 
@@ -3398,24 +3429,26 @@ impl LspCommand for GetCompletions {
         buffer: Entity<Buffer>,
         mut cx: AsyncApp,
     ) -> Result<Self> {
-        let version = deserialize_version(&message.version);
-        buffer
-            .update(&mut cx, |buffer, _| buffer.wait_for_version(version))
-            .await?;
         let position = message
             .position
             .and_then(language::proto::deserialize_anchor)
-            .map(|p| {
-                buffer.read_with(&cx, |buffer, _| {
-                    buffer.clip_point_utf16(Unclipped(p.to_point_utf16(buffer)), Bias::Left)
-                })
-            })
             .context("invalid position")?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })
+            .await?;
+        buffer
+            .update(&mut cx, |buffer, _| buffer.wait_for_anchors([position]))
+            .await?;
         Ok(Self {
             position,
             context: CompletionContext {
-                trigger_kind: CompletionTriggerKind::INVOKED,
-                trigger_character: None,
+                trigger_kind: match &message.trigger_character {
+                    Some(_) => CompletionTriggerKind::TRIGGER_CHARACTER,
+                    None => CompletionTriggerKind::INVOKED,
+                },
+                trigger_character: message.trigger_character,
             },
             server_id: message
                 .server_id
@@ -3520,6 +3553,44 @@ pub(crate) fn parse_completion_text_edit(
         replace_range,
         new_text: new_text.clone(),
     })
+}
+
+fn completion_text_edit(
+    lsp_completion: &lsp::CompletionItem,
+    lsp_defaults: Option<&lsp::CompletionListItemDefaults>,
+) -> Option<lsp::CompletionTextEdit> {
+    lsp_completion.text_edit.clone().or_else(|| {
+        let default_text_edit = lsp_defaults?.edit_range.as_ref()?;
+        let new_text = lsp_completion
+            .text_edit_text
+            .as_ref()
+            .unwrap_or(&lsp_completion.label)
+            .clone();
+        match default_text_edit {
+            CompletionListItemDefaultsEditRange::Range(range) => {
+                Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                    range: *range,
+                    new_text,
+                }))
+            }
+            CompletionListItemDefaultsEditRange::InsertAndReplace { insert, replace } => Some(
+                lsp::CompletionTextEdit::InsertAndReplace(lsp::InsertReplaceEdit {
+                    new_text,
+                    insert: *insert,
+                    replace: *replace,
+                }),
+            ),
+        }
+    })
+}
+
+fn completion_token_range(snapshot: &BufferSnapshot, offset: usize) -> Range<usize> {
+    let (range, kind) = snapshot.surrounding_word(offset, Some(CharScopeContext::Completion));
+    if kind == Some(CharKind::Word) {
+        range
+    } else {
+        offset..offset
+    }
 }
 
 #[async_trait(?Send)]
@@ -3910,13 +3981,59 @@ impl LspCommand for OnTypeFormatting {
 }
 
 impl InlayHints {
-    pub async fn lsp_to_project_hint(
+    fn project_hint_kind(kind: Option<lsp::InlayHintKind>) -> Option<InlayHintKind> {
+        kind.and_then(|kind| match kind {
+            lsp::InlayHintKind::TYPE => Some(InlayHintKind::Type),
+            lsp::InlayHintKind::PARAMETER => Some(InlayHintKind::Parameter),
+            _ => None,
+        })
+    }
+
+    /// Returns the clipped position and the bias to use for this hint in isolation.
+    fn hint_position_and_bias(
+        lsp_hint: &lsp::InlayHint,
+        snapshot: &BufferSnapshot,
+    ) -> (PointUtf16, Bias) {
+        let position = snapshot.clip_point_utf16(point_from_lsp(lsp_hint.position), Bias::Left);
+        let bias = match Self::project_hint_kind(lsp_hint.kind) {
+            Some(InlayHintKind::Type) => Bias::Right,
+            Some(InlayHintKind::Parameter) => Bias::Left,
+            // `None`-kinded hints can go either way: rust-analyzer's `Lifetime` before `str`
+            // in `&str` is a prefix, while `ClosingBrace` after `}` is a suffix. Asymmetric
+            // padding is a reliable signal: space before the hint (`padding_left`) means it is
+            // a suffix attached to the left → Right; space after (`padding_right`) means it is
+            // a prefix attached to the right → Left. When padding is ambiguous, fall back to
+            // `surrounding_word`, which uses the greater of `prev` and `next` as the word-kind
+            // level: if the previous character's kind is greater than or equal to the next
+            // character's kind, the hint is a suffix → Right; otherwise, it is a prefix → Left.
+            // `None` covers both directions.
+            None => match (
+                lsp_hint.padding_left.unwrap_or(false),
+                lsp_hint.padding_right.unwrap_or(false),
+            ) {
+                (true, false) => Bias::Right,
+                (false, true) => Bias::Left,
+                _ => {
+                    let offset = position.to_offset(snapshot);
+                    let (range, _) = snapshot.surrounding_word(offset, None);
+                    if range.start < offset {
+                        Bias::Right
+                    } else {
+                        Bias::Left
+                    }
+                }
+            },
+        };
+        (position, bias)
+    }
+
+    pub fn lsp_to_project_hint(
         lsp_hint: lsp::InlayHint,
-        buffer_handle: &Entity<Buffer>,
+        position: Anchor,
+        snapshot: &BufferSnapshot,
         server_id: LanguageServerId,
         resolve_state: ResolveState,
         force_no_type_left_padding: bool,
-        cx: &mut AsyncApp,
     ) -> anyhow::Result<InlayHint> {
         let kind = lsp_hint.kind.and_then(|kind| match kind {
             lsp::InlayHintKind::TYPE => Some(InlayHintKind::Type),
@@ -3924,17 +4041,58 @@ impl InlayHints {
             _ => None,
         });
 
-        let position = buffer_handle.read_with(cx, |buffer, _| {
-            let position = buffer.clip_point_utf16(point_from_lsp(lsp_hint.position), Bias::Left);
-            if kind == Some(InlayHintKind::Parameter) {
-                buffer.anchor_before(position)
-            } else {
-                buffer.anchor_after(position)
-            }
-        });
-        let label = Self::lsp_inlay_label_to_project(lsp_hint.label, server_id)
-            .await
-            .context("lsp to project inlay hint conversion")?;
+        let text_edits = lsp_hint
+            .text_edits
+            .map(|edits| {
+                let mut edits = edits
+                    .into_iter()
+                    .map(|edit| {
+                        let range = range_from_lsp(edit.range);
+                        let start = snapshot.clip_point_utf16(range.start, Bias::Left);
+                        let end = snapshot.clip_point_utf16(range.end, Bias::Left);
+                        anyhow::ensure!(
+                            start <= end,
+                            "invalid inlay hint text edit range: {:?}",
+                            edit.range
+                        );
+                        Ok((start..end, edit.new_text))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                edits.sort_by_key(|(range, _)| (range.start, range.end));
+                anyhow::ensure!(
+                    edits
+                        .windows(2)
+                        .all(|edits| edits[0].0.end <= edits[1].0.start),
+                    "overlapping inlay hint text edits"
+                );
+                edits.dedup_by(|(range, new_text), (previous_range, previous_text)| {
+                    let adjacent = previous_range.end == range.start;
+                    if adjacent {
+                        previous_range.end = range.end;
+                        previous_text.push_str(new_text);
+                    }
+                    adjacent
+                });
+                let edits = edits
+                    .into_iter()
+                    .map(|(range, mut new_text)| {
+                        LineEnding::normalize(&mut new_text);
+                        let start = snapshot.anchor_after(range.start);
+                        let end = if range.is_empty() {
+                            start
+                        } else {
+                            snapshot.anchor_before(range.end)
+                        };
+                        (start..end, new_text)
+                    })
+                    .collect();
+                anyhow::Ok(InlayHintTextEdits {
+                    edits,
+                    buffer_version: snapshot.version().clone(),
+                })
+            })
+            .transpose()?;
+        let label = Self::lsp_inlay_label_to_project(lsp_hint.label, server_id);
         let padding_left = if force_no_type_left_padding && kind == Some(InlayHintKind::Type) {
             false
         } else {
@@ -3943,6 +4101,7 @@ impl InlayHints {
 
         Ok(InlayHint {
             position,
+            text_edits,
             padding_left,
             padding_right: lsp_hint.padding_right.unwrap_or(false),
             label,
@@ -3963,10 +4122,28 @@ impl InlayHints {
         })
     }
 
-    async fn lsp_inlay_label_to_project(
+    pub async fn wait_for_hints_version(
+        message_hints: &[proto::InlayHint],
+        buffer_version: &[proto::VectorClockEntry],
+        buffer: &Entity<Buffer>,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        let mut buffer_version = deserialize_version(buffer_version);
+        for text_edits in message_hints
+            .iter()
+            .filter_map(|hint| hint.text_edits.as_ref())
+        {
+            buffer_version.join(&deserialize_version(&text_edits.buffer_version));
+        }
+        buffer
+            .update(cx, |buffer, _| buffer.wait_for_version(buffer_version))
+            .await
+    }
+
+    fn lsp_inlay_label_to_project(
         lsp_label: lsp::InlayHintLabel,
         server_id: LanguageServerId,
-    ) -> anyhow::Result<InlayHintLabel> {
+    ) -> InlayHintLabel {
         let label = match lsp_label {
             lsp::InlayHintLabel::String(s) => InlayHintLabel::String(s),
             lsp::InlayHintLabel::LabelParts(lsp_parts) => {
@@ -3989,16 +4166,18 @@ impl InlayHints {
                             }
                         }),
                         location: Some(server_id).zip(lsp_part.location),
+                        command: Some(server_id).zip(lsp_part.command),
                     });
                 }
                 InlayHintLabel::LabelParts(parts)
             }
         };
 
-        Ok(label)
+        label
     }
 
     pub fn project_to_proto_hint(response_hint: InlayHint) -> proto::InlayHint {
+        let position = response_hint.position;
         let (state, lsp_resolve_state) = match response_hint.resolve_state {
             ResolveState::Resolved => (0, None),
             ResolveState::CanResolve(server_id, resolve_data) => (
@@ -4018,6 +4197,13 @@ impl InlayHints {
             lsp_resolve_state,
         });
         proto::InlayHint {
+            text_edits: response_hint.text_edits.map(|text_edits| proto::InlayHintTextEdits {
+                edits: text_edits.edits.into_iter().map(|(range, new_text)| proto::InlayHintTextEdit {
+                    range: Some(serialize_anchor_range(range)),
+                    new_text,
+                }).collect(),
+                buffer_version: serialize_version(&text_edits.buffer_version),
+            }),
             position: Some(language::proto::serialize_anchor(&response_hint.position)),
             padding_left: response_hint.padding_left,
             padding_right: response_hint.padding_right,
@@ -4046,6 +4232,12 @@ impl InlayHints {
                                 location_range_start,
                                 location_range_end,
                                 language_server_id: label_part.location.as_ref().map(|(server_id, _)| server_id.0 as u64),
+                                command: label_part.command.map(|(server_id, command)| LspStore::serialize_code_action(&CodeAction {
+                                    server_id,
+                                    range: position..position,
+                                    lsp_action: LspAction::Command(command),
+                                    resolved: true,
+                                })),
                             }}).collect()
                         })
                     }
@@ -4099,7 +4291,27 @@ impl InlayHints {
                 anyhow::bail!("Unexpected resolve state {invalid} for hint {message_hint:?}")
             }
         };
+        let text_edits = message_hint
+            .text_edits
+            .map(|text_edits| {
+                let edits = text_edits
+                    .edits
+                    .into_iter()
+                    .map(|edit| {
+                        let range = deserialize_anchor_range(
+                            edit.range.context("missing inlay hint text edit range")?,
+                        )?;
+                        Ok((range, edit.new_text))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                anyhow::Ok(InlayHintTextEdits {
+                    edits,
+                    buffer_version: deserialize_version(&text_edits.buffer_version),
+                })
+            })
+            .transpose()?;
         Ok(InlayHint {
+            text_edits,
             position: message_hint
                 .position
                 .and_then(language::proto::deserialize_anchor)
@@ -4164,6 +4376,23 @@ impl InlayHints {
                                     None => None,
                                 }
                             },
+                            command: match part.command {
+                                Some(command) => {
+                                    let action = LspStore::deserialize_code_action(command)
+                                        .context("invalid command in inlay hint label part")?;
+                                    match action.lsp_action {
+                                        LspAction::Command(command) => {
+                                            Some((action.server_id, command))
+                                        }
+                                        LspAction::Action(_) | LspAction::CodeLens(_) => {
+                                            anyhow::bail!(
+                                                "unexpected non-command action in inlay hint label part"
+                                            )
+                                        }
+                                    }
+                                }
+                                None => None,
+                            },
                         });
                     }
 
@@ -4195,14 +4424,46 @@ impl InlayHints {
         })
     }
 
-    pub fn project_to_lsp_hint(hint: InlayHint, snapshot: &BufferSnapshot) -> lsp::InlayHint {
-        lsp::InlayHint {
+    pub fn project_to_lsp_hint(
+        hint: InlayHint,
+        snapshot: &BufferSnapshot,
+    ) -> Result<lsp::InlayHint> {
+        anyhow::ensure!(
+            snapshot.can_resolve(&hint.position),
+            "invalid inlay hint position anchor"
+        );
+        Ok(lsp::InlayHint {
             position: point_to_lsp(hint.position.to_point_utf16(snapshot)),
             kind: hint.kind.map(|kind| match kind {
                 InlayHintKind::Type => lsp::InlayHintKind::TYPE,
                 InlayHintKind::Parameter => lsp::InlayHintKind::PARAMETER,
             }),
-            text_edits: None,
+            text_edits: hint
+                .text_edits
+                .map(|text_edits| {
+                    text_edits
+                        .edits
+                        .into_iter()
+                        .map(|(range, new_text)| {
+                            anyhow::ensure!(
+                                snapshot.can_resolve(&range.start),
+                                "invalid inlay hint text edit start anchor"
+                            );
+                            anyhow::ensure!(
+                                snapshot.can_resolve(&range.end),
+                                "invalid inlay hint text edit end anchor"
+                            );
+                            let start = range.start.to_point_utf16(snapshot);
+                            let end = range.end.to_point_utf16(snapshot);
+                            anyhow::ensure!(start <= end, "reversed inlay hint text edit range");
+                            Ok(lsp::TextEdit {
+                                range: lsp::Range::new(point_to_lsp(start), point_to_lsp(end)),
+                                new_text,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?,
             tooltip: hint.tooltip.and_then(|tooltip| {
                 Some(match tooltip {
                     InlayHintTooltip::String(s) => lsp::InlayHintTooltip::String(s),
@@ -4249,7 +4510,7 @@ impl InlayHints {
                                 })
                             }),
                             location: part.location.map(|(_, location)| location),
-                            command: None,
+                            command: part.command.map(|(_, command)| command),
                         })
                         .collect(),
                 ),
@@ -4260,7 +4521,7 @@ impl InlayHints {
                 ResolveState::CanResolve(_, data) => data,
                 ResolveState::Resolving | ResolveState::Resolved => None,
             },
-        }
+        })
     }
 
     pub fn can_resolve_inlays(capabilities: &ServerCapabilities) -> bool {
@@ -4349,31 +4610,33 @@ impl LspCommand for InlayHints {
             )
         });
 
-        let hints = message.unwrap_or_default().into_iter().map(|lsp_hint| {
-            let resolve_state = if can_resolve {
-                ResolveState::CanResolve(lsp_server.server_id(), lsp_hint.data.clone())
-            } else {
-                ResolveState::Resolved
-            };
-
-            let buffer = buffer.clone();
-            cx.spawn(async move |cx| {
+        let snapshot = buffer.read_with(&cx, |buffer, _| buffer.snapshot());
+        let last_row = snapshot.max_point().row;
+        let hints = message
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|lsp_hint| lsp_hint.position.line <= last_row)
+            .filter_map(|lsp_hint| {
+                let resolve_state = if can_resolve {
+                    ResolveState::CanResolve(lsp_server.server_id(), lsp_hint.data.clone())
+                } else {
+                    ResolveState::Resolved
+                };
+                let (position, bias) = InlayHints::hint_position_and_bias(&lsp_hint, &snapshot);
                 InlayHints::lsp_to_project_hint(
                     lsp_hint,
-                    &buffer,
+                    snapshot.anchor_at(position, bias),
+                    &snapshot,
                     server_id,
                     resolve_state,
                     force_no_type_left_padding,
-                    cx,
                 )
-                .await
+                .context("lsp to project inlay hint conversion")
+                .log_err()
             })
-        });
-        future::join_all(hints)
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<_>>()
-            .context("lsp to project inlay hints conversion")
+            .collect();
+
+        Ok(hints)
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::InlayHints {
@@ -4432,18 +4695,13 @@ impl LspCommand for InlayHints {
         buffer: Entity<Buffer>,
         mut cx: AsyncApp,
     ) -> anyhow::Result<Vec<InlayHint>> {
-        buffer
-            .update(&mut cx, |buffer, _| {
-                buffer.wait_for_version(deserialize_version(&message.version))
-            })
+        InlayHints::wait_for_hints_version(&message.hints, &message.version, &buffer, &mut cx)
             .await?;
-
-        let mut hints = Vec::new();
-        for message_hint in message.hints {
-            hints.push(InlayHints::proto_to_project_hint(message_hint)?);
-        }
-
-        Ok(hints)
+        message
+            .hints
+            .into_iter()
+            .map(InlayHints::proto_to_project_hint)
+            .collect()
     }
 
     fn buffer_id_from_proto(message: &proto::InlayHints) -> Result<BufferId> {
