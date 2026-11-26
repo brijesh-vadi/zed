@@ -109,6 +109,7 @@ Smoke test the running app:
 ## Common gotchas
 
 - **`cargo: command not found`** in the agent shell → `export PATH="$HOME/.cargo/bin:$PATH"`
+- **`ls` hangs** in an agent command → it's aliased to `eza`; use `\ls` or `command ls`
 - **First build on a fresh machine** → `cargo check -p git_ui` took ~5 min (mostly dependency downloads); release build ~9 min on an M-series Mac with a warm cache
 
 - **`metal` not found** → run `xcodebuild -downloadComponent MetalToolchain`
