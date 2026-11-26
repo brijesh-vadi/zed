@@ -1,5 +1,7 @@
 # Fork Sync Guide: Keeping Your Zed Fork Updated
 
+> **Outdated.** The custom code described below has been replaced by upstream's `SoloDiffView`. See [AGENT-FORK-NOTES.md](./AGENT-FORK-NOTES.md) for the current customizations, build steps and merge playbook.
+
 This guide explains how to keep your forked Zed repository in sync with the official Zed repository while preserving your custom single-file diff feature.
 
 ## Repository Setup
